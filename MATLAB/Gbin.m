@@ -27,6 +27,7 @@ classdef Gbin
 %   Supported containers:
 %     - scalar struct (possibly nested)
 %     - scalar objects and object arrays (stored as struct with gbin_class/gbin_size/gbin_elements)
+%     - table (stored as a struct with metadata + per-variable columns)
 %
 %   Design goals:
 %     - Speed > memory efficiency (chunks are built in memory be fore writing)
@@ -47,8 +48,9 @@ classdef Gbin
         DEFAULT_COMPRESSION = true;
         DEFAULT_COMPRESSION_MODE = 'never'; % 'auto'|'always'|'never'
         COMPRESS_THRESHOLD_BYTES = 1024;   % skip compression below this
-        % 1=fast, 9=best compression
-        DEFLATE_LEVEL = 1;
+        MAX_HEADER_LEN_BYTES = 64*1024*1024; % 64 MiB
+        
+        DEFLATE_LEVEL = 1; % 1=fast, 9=best compression
 
         % CRC validation is expensive; default OFF for speed-first.
         DEFAULT_CRC = false;
@@ -427,7 +429,7 @@ classdef Gbin
 
             % Read header length
             header_len = fread(fid, 1, 'uint32');
-            if isempty(header_len) || header_len < 2 || header_len > 2^31
+            if isempty(header_len) || header_len < 2 || header_len > Gbin.MAX_HEADER_LEN_BYTES
                 error('Gbin:Format', 'Invalid header length in file: %s', filename);
             end
 
@@ -498,11 +500,14 @@ classdef Gbin
 
             % Payload begins immediately after header
             payload_start = 8 + 4 + double(header_len);
+
+            % If the header includes payload_start, accept it only when validating and consistent.
             if isfield(meta, 'payload_start') && ~isempty(meta.payload_start)
-                % Trust header value if consistent; otherwise fall back.
                 ps_hdr = double(meta.payload_start);
-                if ps_hdr > 0
-                    payload_start = ps_hdr;
+                if do_validate && ps_hdr > 0 && ps_hdr ~= payload_start
+                    error('Gbin:Format', ...
+                        'payload_start mismatch: header says %d, computed %d. File may be corrupt.', ...
+                        ps_hdr, payload_start);
                 end
             end
             if debug
@@ -526,12 +531,14 @@ classdef Gbin
             % If 'vars' requested: read only those exact leaves (coalesced)
             if ~isempty(vars_req)
                 data = Gbin.readVarsLeaves(fid, payload_start, fields_meta, vars_req, need_swap, do_validate);
+                data = Gbin.rehydratePacked(data);
                 return;
             end
 
             % If 'var' requested: read only that leaf or subtree
             if ~isempty(var_req)
                 data = Gbin.readVarOrSubtree(fid, payload_start, fields_meta, var_req, need_swap, do_validate);
+                data = Gbin.rehydratePacked(data);
                 return;
             end
 
@@ -554,6 +561,18 @@ classdef Gbin
 
                 if off + csz > numel(payload)
                     error('Gbin:Format', 'Field chunk out of bounds (%s). File may be corrupt.', f.name);
+                end
+
+                if do_validate
+                    % Ensure field is within the actual file bounds as well.
+                    cur_pos = ftell(fid);
+                    fseek(fid, 0, 'eof');
+                    file_size = ftell(fid);
+                    fseek(fid, cur_pos, 'bof');
+
+                    if payload_start + off + csz > file_size
+                        error('Gbin:Format', 'Field chunk out of file bounds (%s). File may be corrupt.', f.name);
+                    end
                 end
 
                 chunk = payload(off + 1 : off + csz);
@@ -608,6 +627,9 @@ classdef Gbin
             else
                 data = out_struct;
             end
+
+            % Restore packed containers (e.g., table) back into native MATLAB types.
+            data = Gbin.rehydratePacked(data);
         end
         
         function meta = showHeader(filename)
@@ -631,7 +653,7 @@ classdef Gbin
             end
 
             header_len = fread(fid, 1, 'uint32');
-            if isempty(header_len) || header_len < 2 || header_len > 2^31
+            if isempty(header_len) || header_len < 2 || header_len > Gbin.MAX_HEADER_LEN_BYTES
                 error('Gbin:Format', 'Invalid header length in file: %s', filename);
             end
 
@@ -734,7 +756,7 @@ classdef Gbin
             end
 
             header_len = fread(fid, 1, 'uint32');
-            if isempty(header_len) || header_len < 2 || header_len > 2^31
+            if isempty(header_len) || header_len < 2 || header_len > Gbin.MAX_HEADER_LEN_BYTES
                 error('Gbin:Format', 'Invalid header length in file: %s', filename);
             end
 
@@ -1113,6 +1135,135 @@ classdef Gbin
     end
 
     methods (Static, Access = private)
+        function v = structToTableIfPacked(s)
+            %STRUCTTOTABLEIFPACKED  Rebuild a MATLAB table from the exported struct representation.
+            %
+            % The packed representation is created by tableToStruct and consists of:
+            %   gbin_kind == 'table'
+            %   gbin_varnames, gbin_varnames_key, gbin_vars
+            % plus optional gbin_row_names, gbin_dim_names.
+
+            v = s;
+            if ~isstruct(s) || ~isscalar(s)
+                return;
+            end
+            if ~isfield(s, 'gbin_kind')
+                return;
+            end
+
+            try
+                kind = char(string(s.gbin_kind));
+            catch
+                return;
+            end
+            if ~strcmpi(kind, 'table')
+                return;
+            end
+
+            if ~isfield(s, 'gbin_vars') || ~isstruct(s.gbin_vars)
+                error('Gbin:Format', 'Packed table missing gbin_vars.');
+            end
+
+            % Variable names
+            var_names = strings(0,1);
+            var_keys  = strings(0,1);
+            try
+                if isfield(s, 'gbin_varnames')
+                    var_names = string(s.gbin_varnames(:));
+                end
+                if isfield(s, 'gbin_varnames_key')
+                    var_keys = string(s.gbin_varnames_key(:));
+                end
+            catch
+            end
+
+            if isempty(var_keys)
+                % Fallback to struct fieldnames if keys are missing.
+                var_keys = string(fieldnames(s.gbin_vars));
+            end
+            if isempty(var_names)
+                var_names = var_keys;
+            end
+
+            % Build table columns in order
+            cols = cell(1, numel(var_keys));
+            for i = 1:numel(var_keys)
+                key = char(var_keys(i));
+                if ~isfield(s.gbin_vars, key)
+                    error('Gbin:Format', 'Packed table missing variable key "%s".', key);
+                end
+                cols{i} = s.gbin_vars.(key);
+            end
+
+            % Construct table
+            try
+                t = table(cols{:}, 'VariableNames', cellstr(var_names));
+            catch
+                % If some columns are not directly accepted, build via empty table then assign.
+                t = table();
+                for i = 1:numel(var_names)
+                    t.(char(var_names(i))) = cols{i};
+                end
+            end
+
+            % Row names (optional)
+            try
+                if isfield(s, 'gbin_row_names') && ~isempty(s.gbin_row_names)
+                    rn = string(s.gbin_row_names(:));
+                    t.Properties.RowNames = cellstr(rn);
+                end
+            catch
+            end
+
+            % Dimension names (optional)
+            try
+                if isfield(s, 'gbin_dim_names') && ~isempty(s.gbin_dim_names)
+                    dn = string(s.gbin_dim_names(:));
+                    if numel(dn) == 2
+                        t.Properties.DimensionNames = cellstr(dn);
+                    end
+                end
+            catch
+            end
+
+            v = t;
+        end
+
+        function v = rehydratePacked(v)
+            %REHYDRATEPACKED  Recursively convert packed container representations.
+            %
+            % Today this restores packed tables back into MATLAB `table`.
+
+            % Packed table (struct marker)
+            if isstruct(v) && isscalar(v) && isfield(v, 'gbin_kind')
+                v2 = Gbin.structToTableIfPacked(v);
+                if istable(v2)
+                    v = v2;
+                    return;
+                end
+            end
+
+            % Recurse into structs
+            if isstruct(v)
+                for ii = 1:numel(v)
+                    fn = fieldnames(v(ii));
+                    for j = 1:numel(fn)
+                        f = fn{j};
+                        v(ii).(f) = Gbin.rehydratePacked(v(ii).(f));
+                    end
+                end
+                return;
+            end
+
+            % Recurse into cells
+            if iscell(v)
+                for i = 1:numel(v)
+                    v{i} = Gbin.rehydratePacked(v{i});
+                end
+                return;
+            end
+        end
+        
         function safeFclose(fid)
             %SAFEFCLOSE  Close file if the identifier is valid; ignore errors.
             try
@@ -1174,12 +1325,20 @@ classdef Gbin
                     return;
                 end
 
+                % Tables are exported as structs (metadata + per-variable columns).
+                % This avoids introducing a new on-disk leaf encoding.
+                if istable(v)
+                    s_tbl = Gbin.tableToStruct(v, prefix);
+                    rec(s_tbl, prefix);
+                    return;
+                end
+
                 % Convert user-defined MATLAB objects (including object arrays) to a struct representation.
                 % NOTE: Many built-in types are objects too (string, datetime, duration, etc.).
                 % Those are handled as leaves by serializeLeaf, so we must NOT convert them here.
                 if isobject(v) && ~isa(v, 'categorical') && ...
                         ~isstring(v) && ~isa(v, 'datetime') && ~isa(v, 'duration') && ~isa(v, 'calendarDuration') && ...
-                        ~isa(v, 'table') && ~isa(v, 'timetable') && ~isa(v, 'containers.Map')
+                        ~isa(v, 'containers.Map')
                     s_obj_struct = Gbin.objectToStruct(v, prefix);
                     rec(s_obj_struct, prefix);
                     return;
@@ -1202,6 +1361,108 @@ classdef Gbin
             end
 
             entries = struct('name', names, 'value', values);
+        end
+        
+        function s = tableToStruct(tbl, prefix)
+            %TABLETOSTRUCT  Convert a MATLAB table into a struct representation.
+            %
+            % The representation is designed to be stable and self-describing without adding
+            % a new leaf encoding. Columns are stored as normal GBF values.
+            %
+            % Fields:
+            %   - gbin_kind          = 'table'
+            %   - gbin_nrows         = uint32(height(tbl))
+            %   - gbin_nvars         = uint32(width(tbl))
+            %   - gbin_varnames      = string(tbl.Properties.VariableNames)
+            %   - gbin_varnames_key  = string(valid field names used in gbin_vars)
+            %   - gbin_row_names     = string(...) or []
+            %   - gbin_dim_names     = string(tbl.Properties.DimensionNames)
+            %   - gbin_vars          = struct of columns keyed by valid names
+            %
+            % NOTE: If variable names are not valid MATLAB identifiers, we store both the
+            % original names and the sanitized field keys.
+
+            if nargin < 2
+                prefix = '';
+            end
+
+            try
+                var_names = string(tbl.Properties.VariableNames);
+            catch
+                var_names = string({});
+            end
+
+            % Create deterministic, valid field keys for gbin_vars.
+            var_keys = strings(size(var_names));
+            for i = 1:numel(var_names)
+                var_keys(i) = string(matlab.lang.makeValidName(char(var_names(i)), 'ReplacementStyle', 'underscore'));
+            end
+
+            % Ensure uniqueness of keys.
+            if numel(unique(var_keys)) ~= numel(var_keys)
+                % makeUniqueStrings exists in newer MATLAB; fall back if missing.
+                try
+                    var_keys = string(matlab.lang.makeUniqueStrings(cellstr(var_keys)));
+                catch
+                    % Simple uniqueness fallback
+                    seen = containers.Map('KeyType', 'char', 'ValueType', 'uint32');
+                    for i = 1:numel(var_keys)
+                        k = char(var_keys(i));
+                        if isKey(seen, k)
+                            seen(k) = seen(k) + 1;
+                            var_keys(i) = string(sprintf('%s_%u', k, seen(k)));
+                        else
+                            seen(k) = uint32(0);
+                        end
+                    end
+                end
+            end
+
+            s = struct();
+            s.gbin_kind = "table";
+            s.gbin_class = "table";
+            s.gbin_nrows = uint32(height(tbl));
+            s.gbin_nvars = uint32(width(tbl));
+            s.gbin_varnames = var_names;
+            s.gbin_varnames_key = var_keys;
+
+            % Row names (optional)
+            rn = [];
+            try
+                if ~isempty(tbl.Properties.RowNames)
+                    rn = string(tbl.Properties.RowNames);
+                end
+            catch
+            end
+            s.gbin_row_names = rn;
+
+            % Dimension names (optional)
+            dn = [];
+            try
+                if ~isempty(tbl.Properties.DimensionNames)
+                    dn = string(tbl.Properties.DimensionNames);
+                end
+            catch
+            end
+            s.gbin_dim_names = dn;
+
+            % Variables
+            vars_struct = struct();
+            for i = 1:width(tbl)
+                key = char(var_keys(i));
+                try
+                    vars_struct.(key) = tbl{:, i};
+                catch
+                    % Some variables may not support brace indexing cleanly (e.g., nested tables).
+                    % Fall back to the variable as stored.
+                    try
+                        vars_struct.(key) = tbl.(char(var_names(i)));
+                    catch ME
+                        error('Gbin:Unsupported', 'Cannot export table variable "%s" at "%s": %s', char(var_names(i)), prefix, ME.message);
+                    end
+                end
+            end
+            s.gbin_vars = vars_struct;
         end
 
         function s = objectToStruct(obj, prefix)

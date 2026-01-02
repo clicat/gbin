@@ -4,7 +4,7 @@ use crate::header::{
     MAGIC_BYTES, VERSION,
 };
 use crate::value::{
-    element_count, CalendarDurationArray, CategoricalArray, CharArray, DateTimeArray, DurationArray,
+    CalendarDurationArray, CategoricalArray, CharArray, DateTimeArray, DurationArray,
     GbfValue, LogicalArray, NumericArray, NumericClass, StringArray,
 };
 use flate2::read::ZlibDecoder;
@@ -67,6 +67,44 @@ const AUTO_ENTROPY_MAX_UNIQUE_RATIO: f64 = 0.95;
 // Coalesced random-access read grouping.
 const READ_COALESCE_MAX_GAP_BYTES: u64 = 4096;
 const READ_COALESCE_MAX_GROUP_BYTES: u64 = 8 * 1024 * 1024;
+
+// Hardening caps. These are not format limits; they prevent accidental/hostile OOM.
+// Large matrices are supported: set field limits to 16 GiB.
+const MAX_HEADER_LEN: u32 = 64 * 1024 * 1024; // 64 MiB
+const MAX_FIELD_USIZE: u64 = 16u64 * 1024u64 * 1024u64 * 1024u64; // 16 GiB
+const MAX_FIELD_CSIZE: u64 = 16u64 * 1024u64 * 1024u64 * 1024u64; // 16 GiB
+
+fn checked_add_u64(a: u64, b: u64) -> Result<u64> {
+    a.checked_add(b)
+        .ok_or_else(|| GbfError::Format("u64 addition overflow".to_string()))
+}
+
+fn mul_usize(a: usize, b: usize) -> Result<usize> {
+    a.checked_mul(b)
+        .ok_or_else(|| GbfError::Format("usize multiplication overflow".to_string()))
+}
+
+fn element_count_checked(shape: &[usize]) -> Result<usize> {
+    if shape.is_empty() {
+        return Ok(0);
+    }
+
+    // MATLAB/GBF may represent empty arrays with one or more zero-sized dimensions.
+    // In that case, the element count is 0.
+    if shape.iter().any(|&d| d == 0) {
+        return Ok(0);
+    }
+
+    let mut n: usize = 1;
+    for &d in shape {
+        n = mul_usize(n, d)?;
+    }
+    Ok(n)
+}
+
+fn u64_to_usize(v: u64, what: &str) -> Result<usize> {
+    usize::try_from(v).map_err(|_| GbfError::Unsupported(format!("{} too large for this platform", what)))
+}
 
 fn normalize_path<P: AsRef<Path>>(path: P) -> PathBuf {
     let p = path.as_ref();
@@ -136,10 +174,17 @@ fn zlib_compress(raw: &[u8], level: u32) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-fn zlib_decompress(comp: &[u8]) -> Result<Vec<u8>> {
-    let mut dec = ZlibDecoder::new(comp);
+fn zlib_decompress(comp: &[u8], max_out: u64) -> Result<Vec<u8>> {
+    let max_out = max_out.min(MAX_FIELD_USIZE);
+    let dec = ZlibDecoder::new(comp);
     let mut out = Vec::new();
-    dec.read_to_end(&mut out)?;
+
+    // Read at most max_out + 1 bytes to detect overflow.
+    let mut limited = dec.take(max_out.saturating_add(1));
+    limited.read_to_end(&mut out)?;
+    if out.len() as u64 > max_out {
+        return Err(GbfError::Format("decompressed data exceeds configured limit".to_string()));
+    }
     Ok(out)
 }
 
@@ -211,13 +256,40 @@ fn encode_leaf(name: &str, value: &GbfValue) -> Result<(Vec<u8>, String, String,
     // returns: raw_bytes, kind, class_name, shape, complex, encoding
     match value {
         GbfValue::Numeric(arr) => {
-            let mut raw = Vec::new();
-            raw.extend_from_slice(&arr.real_le);
-            if arr.complex {
+            let n = element_count_checked(&arr.shape)?;
+            let bpe = arr.class.bytes_per_element();
+            let expected = mul_usize(n, bpe)?;
+
+            if arr.real_le.len() != expected {
+                return Err(GbfError::Format(format!(
+                    "numeric `{}` real_le size mismatch: expected {} bytes, got {}",
+                    name, expected, arr.real_le.len()
+                )));
+            }
+
+            if !arr.complex {
+                if arr.imag_le.is_some() {
+                    return Err(GbfError::Format(format!(
+                        "numeric `{}` is not complex but imag_le is present",
+                        name
+                    )));
+                }
+            } else {
                 let imag = arr.imag_le.as_ref().ok_or_else(|| {
                     GbfError::Format(format!("numeric array `{}` is complex but imag_le is None", name))
                 })?;
-                raw.extend_from_slice(imag);
+                if imag.len() != expected {
+                    return Err(GbfError::Format(format!(
+                        "numeric `{}` imag_le size mismatch: expected {} bytes, got {}",
+                        name, expected, imag.len()
+                    )));
+                }
+            }
+
+            let mut raw = Vec::with_capacity(expected * if arr.complex { 2 } else { 1 });
+            raw.extend_from_slice(&arr.real_le);
+            if arr.complex {
+                raw.extend_from_slice(arr.imag_le.as_ref().unwrap());
             }
             let shape_u64: Vec<u64> = arr.shape.iter().map(|&d| d as u64).collect();
             Ok((
@@ -256,7 +328,7 @@ fn encode_leaf(name: &str, value: &GbfValue) -> Result<(Vec<u8>, String, String,
             ))
         }
         GbfValue::String(a) => {
-            let n = element_count(&a.shape);
+            let n = element_count_checked(&a.shape)?;
             if a.data.len() != n {
                 return Err(GbfError::Format(format!(
                     "string `{}` shape {:?} implies N={}, but data.len={}",
@@ -295,7 +367,7 @@ fn encode_leaf(name: &str, value: &GbfValue) -> Result<(Vec<u8>, String, String,
             ))
         }
         GbfValue::DateTime(a) => {
-            let n = element_count(&a.shape);
+            let n = element_count_checked(&a.shape)?;
             if a.is_nat.len() != n
                 || a.year.len() != n
                 || a.month.len() != n
@@ -383,7 +455,7 @@ fn encode_leaf(name: &str, value: &GbfValue) -> Result<(Vec<u8>, String, String,
             ))
         }
         GbfValue::Duration(a) => {
-            let n = element_count(&a.shape);
+            let n = element_count_checked(&a.shape)?;
             if a.is_nan.len() != n || a.ms.len() != n {
                 return Err(GbfError::Format(format!(
                     "duration `{}` inconsistent lengths for shape {:?}",
@@ -406,7 +478,7 @@ fn encode_leaf(name: &str, value: &GbfValue) -> Result<(Vec<u8>, String, String,
             ))
         }
         GbfValue::CalendarDuration(a) => {
-            let n = element_count(&a.shape);
+            let n = element_count_checked(&a.shape)?;
             if a.is_missing.len() != n || a.months.len() != n || a.days.len() != n || a.time_ms.len() != n {
                 return Err(GbfError::Format(format!(
                     "calendarDuration `{}` inconsistent lengths for shape {:?}",
@@ -435,7 +507,7 @@ fn encode_leaf(name: &str, value: &GbfValue) -> Result<(Vec<u8>, String, String,
             ))
         }
         GbfValue::Categorical(a) => {
-            let n = element_count(&a.shape);
+            let n = element_count_checked(&a.shape)?;
             if a.codes.len() != n {
                 return Err(GbfError::Format(format!(
                     "categorical `{}` codes.len != N for shape {:?}",
@@ -492,8 +564,11 @@ fn encode_leaf(name: &str, value: &GbfValue) -> Result<(Vec<u8>, String, String,
 fn decode_leaf(field: &FieldMeta, raw: &[u8]) -> Result<GbfValue> {
     let kind = field.kind.to_ascii_lowercase();
     let shape_u64 = &field.shape;
-    let shape: Vec<usize> = shape_u64.iter().map(|&d| d as usize).collect();
-    let n = element_count(&shape);
+    let shape: Vec<usize> = shape_u64
+        .iter()
+        .map(|&d| u64_to_usize(d, "shape dim"))
+        .collect::<Result<Vec<_>>>()?;
+    let n = element_count_checked(&shape)?;
 
     match kind.as_str() {
         "struct" => Ok(GbfValue::EmptyStruct),
@@ -503,7 +578,7 @@ fn decode_leaf(field: &FieldMeta, raw: &[u8]) -> Result<GbfValue> {
                 .ok_or_else(|| GbfError::Unsupported(format!("unknown numeric class `{}`", field.class_name)))?;
 
             let bpe = cls.bytes_per_element();
-            let part_bytes = n.saturating_mul(bpe);
+            let part_bytes = mul_usize(n, bpe)?;
 
             if !field.complex {
                 if raw.len() != part_bytes {
@@ -863,7 +938,7 @@ fn read_header_and_json(file: &mut File, opts: &ReadOptions) -> Result<(Header, 
     }
 
     let header_len = read_u32_le(&mut r)?;
-    if header_len < 2 || header_len > (1 << 31) {
+    if header_len < 2 || header_len > MAX_HEADER_LEN {
         return Err(GbfError::Format("invalid header_len".to_string()));
     }
 
@@ -891,8 +966,17 @@ fn read_header_and_json(file: &mut File, opts: &ReadOptions) -> Result<(Header, 
 
     // Move underlying file cursor to after header.
     let payload_start = 8u64 + 4u64 + header_len as u64;
-    r.seek(SeekFrom::Start(payload_start))?;
 
+    if opts.validate {
+        if header.payload_start > 0 && header.payload_start != payload_start {
+            return Err(GbfError::Format(format!(
+                "payload_start mismatch: header={}, computed={}",
+                header.payload_start, payload_start
+            )));
+        }
+    }
+
+    r.seek(SeekFrom::Start(payload_start))?;
     Ok((header, header_len, header_json))
 }
 
@@ -904,26 +988,54 @@ fn field_payload_start(header_len: u32, header_payload_start: u64) -> u64 {
     }
 }
 
-fn read_field_raw(
-    file: &mut File,
-    payload_start: u64,
-    field: &FieldMeta,
-) -> Result<Vec<u8>> {
-    let off = field.offset;
-    let csz = field.csize;
-    file.seek(SeekFrom::Start(payload_start + off))?;
-    let mut buf = vec![0u8; csz as usize];
+fn read_field_raw(file: &mut File, payload_start: u64, field: &FieldMeta) -> Result<Vec<u8>> {
+    if field.csize > MAX_FIELD_CSIZE {
+        return Err(GbfError::Unsupported(format!(
+            "field `{}` csize exceeds configured limit",
+            field.name
+        )));
+    }
+    if field.usize > MAX_FIELD_USIZE {
+        return Err(GbfError::Unsupported(format!(
+            "field `{}` usize exceeds configured limit",
+            field.name
+        )));
+    }
+
+    let fs = file.metadata()?.len();
+    let pos = checked_add_u64(payload_start, field.offset)?;
+    let end = checked_add_u64(pos, field.csize)?;
+    if end > fs {
+        return Err(GbfError::FieldOutOfBounds {
+            name: field.name.clone(),
+            offset: field.offset,
+            csize: field.csize,
+            payload_len: fs.saturating_sub(payload_start),
+        });
+    }
+
+    file.seek(SeekFrom::Start(pos))?;
+    let csz = u64_to_usize(field.csize, "field csize")?;
+    let mut buf = vec![0u8; csz];
     file.read_exact(&mut buf)?;
     Ok(buf)
 }
 
 fn decode_field_bytes(field: &FieldMeta, comp_bytes: &[u8], validate: bool) -> Result<Vec<u8>> {
+    let max_out = if field.usize > 0 { field.usize } else { MAX_FIELD_USIZE };
+
     let mut raw = if field.compression.eq_ignore_ascii_case("zlib") {
-        zlib_decompress(comp_bytes).map_err(|e| GbfError::DecompressionFailed {
+        zlib_decompress(comp_bytes, max_out).map_err(|e| GbfError::DecompressionFailed {
             name: field.name.clone(),
             message: e.to_string(),
         })?
     } else {
+        if comp_bytes.len() as u64 > MAX_FIELD_USIZE {
+            return Err(GbfError::Unsupported(format!(
+                "field `{}` raw payload exceeds configured limit",
+                field.name
+            )));
+        }
         comp_bytes.to_vec()
     };
 
@@ -966,7 +1078,7 @@ fn coalesced_read(
     let mut out: Vec<(String, Vec<u8>)> = Vec::with_capacity(sorted.len());
 
     let mut group_start = sorted[0].offset;
-    let mut group_end = sorted[0].offset + sorted[0].csize;
+    let mut group_end = checked_add_u64(sorted[0].offset, sorted[0].csize)?;
     let mut group_fields: Vec<&FieldMeta> = vec![sorted[0]];
 
     let flush_group = |file: &mut File,
@@ -976,14 +1088,26 @@ fn coalesced_read(
                        group_fields: &[&FieldMeta]|
      -> Result<Vec<(String, Vec<u8>)>> {
         let size = group_end - group_start;
-        file.seek(SeekFrom::Start(payload_start + group_start))?;
-        let mut buf = vec![0u8; size as usize];
+        let pos = checked_add_u64(payload_start, group_start)?;
+        let fs = file.metadata()?.len();
+        let end = checked_add_u64(pos, size)?;
+        if end > fs {
+            return Err(GbfError::FieldOutOfBounds {
+                name: "<coalesced>".to_string(),
+                offset: group_start,
+                csize: size,
+                payload_len: fs.saturating_sub(payload_start),
+            });
+        }
+        file.seek(SeekFrom::Start(pos))?;
+        let sz = u64_to_usize(size, "coalesced group size")?;
+        let mut buf = vec![0u8; sz];
         file.read_exact(&mut buf)?;
 
         let mut res = Vec::with_capacity(group_fields.len());
         for f in group_fields {
-            let rel = (f.offset - group_start) as usize;
-            let csz = f.csize as usize;
+            let rel = u64_to_usize(f.offset - group_start, "field rel offset")?;
+            let csz = u64_to_usize(f.csize, "field csize")?;
             let chunk = buf[rel..rel + csz].to_vec();
             res.push((f.name.clone(), chunk));
         }
@@ -992,7 +1116,7 @@ fn coalesced_read(
 
     for f in sorted.iter().skip(1) {
         let f_start = f.offset;
-        let f_end = f.offset + f.csize;
+        let f_end = checked_add_u64(f.offset, f.csize)?;
 
         let gap = if f_start > group_end { f_start - group_end } else { 0 };
         let new_group_size = f_end.saturating_sub(group_start);
@@ -1021,29 +1145,24 @@ pub fn read_file<P: AsRef<Path>>(path: P, opts: ReadOptions) -> Result<GbfValue>
 
     let payload_start = field_payload_start(header_len, header.payload_start);
 
-    // Read entire payload
-    file.seek(SeekFrom::Start(payload_start))?;
-    let mut payload = Vec::new();
-    file.read_to_end(&mut payload)?;
-    let payload_len = payload.len() as u64;
 
+    // Decode fields without loading the entire payload into memory.
     let mut out = BTreeMap::<String, GbfValue>::new();
 
-    for f in &header.fields {
-        let off = f.offset;
-        let csz = f.csize;
-        if off + csz > payload_len {
-            return Err(GbfError::FieldOutOfBounds {
-                name: f.name.clone(),
-                offset: off,
-                csize: csz,
-                payload_len,
-            });
-        }
-        let chunk = &payload[off as usize..(off + csz) as usize];
-        let raw = decode_field_bytes(f, chunk, opts.validate)?;
-        let val = decode_leaf(f, &raw)?;
-        assign_by_path(&mut out, &f.name, val)?;
+    // Coalesced IO over all fields (bounded by READ_COALESCE_MAX_GROUP_BYTES).
+    let all_fields: Vec<&FieldMeta> = header.fields.iter().collect();
+    let comp_chunks = coalesced_read(&mut file, payload_start, &all_fields)?;
+
+    for (name, comp_bytes) in comp_chunks {
+        let field = header
+            .fields
+            .iter()
+            .find(|f| f.name == name)
+            .ok_or_else(|| GbfError::Format("internal field lookup failure".to_string()))?;
+
+        let raw = decode_field_bytes(field, &comp_bytes, opts.validate)?;
+        let val = decode_leaf(field, &raw)?;
+        assign_by_path(&mut out, &field.name, val)?;
     }
 
     if header.root.eq_ignore_ascii_case("single") {

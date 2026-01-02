@@ -132,6 +132,18 @@ classdef Gbin_Test
             data.model.labels(2) = categorical(missing); % include <undefined>
             data.model.labels = reshape(data.model.labels, [2 2]);
 
+            % table support (roundtrip)
+            T = table();
+            T.id = int32((1:5).');
+            T.name = ["alpha"; "beta"; "gamma"; "delta"; "epsilon"];
+            T.value = single([1.25; NaN; 3.5; Inf; -2.0]);
+            T.ts = datetime(2020,1,1,0,0,0) + days(0:4).';
+            T.ts(3) = NaT;
+            T.cat = categorical(["a"; "b"; "a"; "c"; "b"]);
+            T.cat(2) = categorical(missing);
+            T.Properties.RowNames = compose('r%d', (1:height(T)).');
+            data.tbl = T;
+
             % Filenames
             f_c = fullfile(tempdir, 'gbin_test_compressed.gbf');
             f_n = fullfile(tempdir, 'gbin_test_uncompressed.gbf');
@@ -297,6 +309,19 @@ classdef Gbin_Test
             data.emptyLogical = false(0, 1);
             data.emptyChar = char(zeros(0,0));
             data.emptyString = strings(0, 1);
+
+            % Empty table
+            data.emptyTable = table();
+
+            % Table with mixed columns (including missing)
+            T2 = table();
+            T2.i = int16((1:4).');
+            T2.s = [""; "x"; missing; "z"];
+            T2.v = [0; NaN; Inf; -Inf];
+            T2.v = single(T2.v);
+            T2.d = duration([0; 1.5; NaN; 3.0], 0, 0);
+            T2.Properties.DimensionNames = {'Row','Vars'};
+            data.tableMixed = T2;
 
             % Numeric extremes and special values
             data.num = struct();

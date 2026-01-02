@@ -1135,14 +1135,11 @@ int gbf_read_header_only(
         return 0;
     }
 
-    /* accept "GREDBIN" (7 bytes) in the first 7, ignore last padding */
+    /* Require the current magic in the first 7 bytes; ignore the last padding byte. */
     if (memcmp(magic, k_magic, k_magic_len) != 0) {
-        /* also accept legacy GRDCBIN if present */
-        if (memcmp(magic, "GRDCBIN", 6) != 0) {
-            fclose(f);
-            gbf_set_err(err, "bad magic (expected '%s')", k_magic);
-            return 0;
-        }
+        fclose(f);
+        gbf_set_err(err, "bad magic (expected '%s')", k_magic);
+        return 0;
     }
 
     uint8_t hlb[4];

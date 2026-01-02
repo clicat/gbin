@@ -11,15 +11,36 @@
 
 namespace gbin::easy {
 
-// Pack a typed vector into little-endian bytes.
-// On modern macOS/Linux/Windows on x86_64/arm64 this is already little-endian.
-// If you ever run on big-endian, you must swap bytes yourself.
+// Pack a typed vector into little-endian element bytes.
+// The GBF on-disk representation is always little-endian.
+namespace detail {
+inline bool is_little_endian() {
+    const std::uint16_t x = 1;
+    return *reinterpret_cast<const std::uint8_t*>(&x) == 1;
+}
+
+inline void bswap_inplace(std::uint8_t* buf, std::size_t elem_size, std::size_t n_elems) {
+    if (!buf || elem_size <= 1 || n_elems == 0) return;
+    for (std::size_t i = 0; i < n_elems; ++i) {
+        std::uint8_t* p = buf + i * elem_size;
+        for (std::size_t a = 0, b = elem_size - 1; a < b; ++a, --b) {
+            std::uint8_t t = p[a];
+            p[a] = p[b];
+            p[b] = t;
+        }
+    }
+}
+} // namespace detail
+
 template <typename T>
 inline std::vector<std::uint8_t> pack_le(const std::vector<T>& v) {
     static_assert(std::is_trivially_copyable_v<T>, "pack_le requires trivially copyable types");
     std::vector<std::uint8_t> out(sizeof(T) * v.size());
     if (!out.empty()) {
         std::memcpy(out.data(), v.data(), out.size());
+        if (!detail::is_little_endian()) {
+            detail::bswap_inplace(out.data(), sizeof(T), v.size());
+        }
     }
     return out;
 }

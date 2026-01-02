@@ -6,7 +6,8 @@ use std::io::{Read};
 use std::path::{Path, PathBuf};
 
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
+    event::{self, Event, KeyCode, KeyEvent, KeyModifiers,
+        DisableMouseCapture, EnableMouseCapture, MouseEventKind},
     execute,
     style::Stylize,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
@@ -455,12 +456,38 @@ fn decode_scalar_to_string(class_key: &str, bytes: &[u8]) -> String {
         "double" => {
             let mut a = [0u8; 8];
             a.copy_from_slice(bytes);
-            f64::from_le_bytes(a).to_string()
+            let v = f64::from_le_bytes(a);
+            if v == 0.0 {
+                "0".to_string()
+            } else {
+                let av = v.abs();
+                if av < 1e-3 || av >= 1e6 {
+                    format!("{:.6e}", v)
+                } else {
+                    let s = format!("{:.6}", v);
+                    s.trim_end_matches('0')
+                        .trim_end_matches('.')
+                        .to_string()
+                }
+            }
         }
         "single" => {
             let mut a = [0u8; 4];
             a.copy_from_slice(bytes);
-            f32::from_le_bytes(a).to_string()
+            let v = f32::from_le_bytes(a) as f64;
+            if v == 0.0 {
+                "0".to_string()
+            } else {
+                let av = v.abs();
+                if av < 1e-3 || av >= 1e6 {
+                    format!("{:.6e}", v)
+                } else {
+                    let s = format!("{:.6}", v);
+                    s.trim_end_matches('0')
+                        .trim_end_matches('.')
+                        .to_string()
+                }
+            }
         }
         "int8" => i8::from_le_bytes([bytes[0]]).to_string(),
         "uint8" => u8::from_le_bytes([bytes[0]]).to_string(),
@@ -543,6 +570,12 @@ struct FlatRow {
     expanded: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Focus {
+    Tree,
+    Preview,
+}
+
 #[derive(Debug)]
 struct ShowState {
     file: PathBuf,
@@ -562,6 +595,13 @@ struct ShowState {
     expanded: std::collections::BTreeMap<String, bool>,
     flat: Vec<FlatRow>,
     selected: usize,
+
+    // Scroll offsets (number of lines from top)
+    tree_scroll: u16,
+    preview_scroll: u16,
+
+    // Which panel receives scroll/key focus.
+    focus: Focus,
 
     // Preview panel state
     preview_title: String,
@@ -593,9 +633,12 @@ impl ShowState {
             expanded: BTreeMap::new(),
             flat: vec![],
             selected: 0,
+            tree_scroll: 0,
+            preview_scroll: 0,
+            focus: Focus::Tree,
             preview_title: "Preview".to_string(),
             preview_lines: vec![
-                "↑/↓ move   → expand   ← collapse   Enter preview   q quit".to_string(),
+                "↑/↓ move  → expand  ← collapse  Enter preview  Tab focus  PgUp/PgDn scroll  mouse wheel  q quit".to_string(),
                 "".to_string(),
                 "Select a node and press Enter.".to_string(),
             ],
@@ -642,11 +685,22 @@ impl ShowState {
     fn move_sel(&mut self, delta: i32) {
         if self.flat.is_empty() {
             self.selected = 0;
+            self.tree_scroll = 0;
             return;
         }
         let cur = self.selected as i32;
         let next = (cur + delta).clamp(0, (self.flat.len() - 1) as i32);
         self.selected = next as usize;
+        // scroll adjusted during draw based on viewport height, but reset if list shrinks
+        if self.selected == 0 {
+            self.tree_scroll = 0;
+        }
+        // Ensure selected stays visible (actual viewport height applied in draw via clamp).
+        // Here we just keep scroll from drifting too far above selection.
+        let sel = self.selected as u16;
+        if sel < self.tree_scroll {
+            self.tree_scroll = sel;
+        }
     }
 
     fn preview_selected(&mut self) {
@@ -670,28 +724,47 @@ impl ShowState {
             let mut lines = vec![];
 
             if let Some(f) = meta {
-                lines.push(format!(
-                    "kind={} class={} shape={} complex={} comp={} off={} csize={} usize={} crc32={:08X}",
-                    f.kind,
-                    f.class_name,
-                    fmt_shape(&f.shape),
-                    f.complex,
-                    f.compression,
-                    f.offset,
-                    f.csize,
-                    f.usize,
-                    f.crc32
-                ));
+                // One property per line: stable, readable, and avoids whitespace tokenization issues.
+                lines.push(format!("kind = {}", f.kind));
+                lines.push(format!("class = {}", f.class_name));
+                lines.push(format!("shape = {}", fmt_shape(&f.shape)));
+                lines.push(format!("complex = {}", f.complex));
+                lines.push(format!("comp = {}", f.compression));
+                lines.push(format!("off = {}", f.offset));
+                lines.push(format!("csize = {}", f.csize));
+                lines.push(format!("usize = {}", f.usize));
+                lines.push(format!("crc32 = {:08X}", f.crc32));
                 if !f.encoding.is_empty() {
-                    lines.push(format!("encoding={}", f.encoding));
+                    lines.push(format!("encoding = {}", f.encoding));
                 }
                 lines.push("".to_string());
             }
 
+            self.preview_scroll = 0;
+
             match read_var(&self.file, &node_path, self.ropts.clone()) {
                 Ok(v) => {
                     // Render preview into lines
-                    let rendered = render_value_preview(&v, self.max_elems, self.rows, self.cols, self.stats);
+                    let mut rendered = render_value_preview(&v, self.max_elems, self.rows, self.cols, self.stats);
+
+                    // We already printed the header metadata above (kind/class/shape/etc.).
+                    // Avoid repeating it in the value preview when possible.
+                    if let Some(first) = rendered.first() {
+                        if first.starts_with("numeric:")
+                            || first.starts_with("logical:")
+                            || first.starts_with("string:")
+                            || first.starts_with("categorical:")
+                            || first.starts_with("struct:")
+                        {
+                            rendered.remove(0);
+                        }
+                    }
+
+                    // If we removed the first line and the next line is empty, drop that too.
+                    if rendered.first().map(|s| s.trim().is_empty()).unwrap_or(false) {
+                        rendered.remove(0);
+                    }
+
                     lines.extend(rendered);
                 }
                 Err(e) => {
@@ -703,6 +776,7 @@ impl ShowState {
             self.preview_lines = lines;
         } else {
             self.preview_title = format!("{}  (branch)", node_path);
+            self.preview_scroll = 0;
             self.preview_lines = vec![
                 "Press → to expand, ← to collapse.".to_string(),
                 "Press Enter on leaves to load data preview.".to_string(),
@@ -769,6 +843,33 @@ fn build_ui_node(tree: &TreeNode, prefix: String) -> UiNode {
     UiNode::new_branch(label, prefix, children)
 }
 
+fn clamp_scroll(scroll: u16, content_len: usize, viewport_h: u16) -> u16 {
+    if viewport_h == 0 {
+        return 0;
+    }
+    let content_len = content_len as u16;
+    if content_len <= viewport_h {
+        return 0;
+    }
+    let max_scroll = content_len.saturating_sub(viewport_h);
+    scroll.min(max_scroll)
+}
+
+fn ensure_visible(scroll: u16, sel: u16, viewport_h: u16) -> u16 {
+    if viewport_h == 0 {
+        return scroll;
+    }
+    let top = scroll;
+    let bottom = scroll.saturating_add(viewport_h.saturating_sub(1));
+    if sel < top {
+        sel
+    } else if sel > bottom {
+        sel.saturating_sub(viewport_h.saturating_sub(1))
+    } else {
+        scroll
+    }
+}
+
 fn flatten_visible(node: &UiNode, depth: usize, out: &mut Vec<FlatRow>, expanded: &BTreeMap<String, bool>) {
     // Skip the artificial root label from printing if it’s empty prefix.
     if !node.full_path.is_empty() {
@@ -805,6 +906,7 @@ fn run_show_tui(state: &mut ShowState) -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnableMouseCapture)?;
 
     let backend = CrosstermBackend::new(stdout);
     let mut term = Terminal::new(backend)?;
@@ -834,6 +936,66 @@ fn run_show_tui(state: &mut ShowState) -> Result<()> {
                             KeyCode::Right => state.toggle_expand_selected(true),
                             KeyCode::Left => state.toggle_expand_selected(false),
                             KeyCode::Enter => state.preview_selected(),
+                            KeyCode::PageUp => {
+                                match state.focus {
+                                    Focus::Tree => state.tree_scroll = state.tree_scroll.saturating_sub(5),
+                                    Focus::Preview => state.preview_scroll = state.preview_scroll.saturating_sub(5),
+                                }
+                            }
+                            KeyCode::PageDown => {
+                                match state.focus {
+                                    Focus::Tree => state.tree_scroll = state.tree_scroll.saturating_add(5),
+                                    Focus::Preview => state.preview_scroll = state.preview_scroll.saturating_add(5),
+                                }
+                            }
+                            KeyCode::Tab => {
+                                state.focus = match state.focus {
+                                    Focus::Tree => Focus::Preview,
+                                    Focus::Preview => Focus::Tree,
+                                };
+                            }
+                            KeyCode::BackTab => {
+                                state.focus = match state.focus {
+                                    Focus::Tree => Focus::Preview,
+                                    Focus::Preview => Focus::Tree,
+                                };
+                            }
+                            KeyCode::Char('w') => {
+                                if state.focus == Focus::Preview {
+                                    state.preview_scroll = state.preview_scroll.saturating_sub(1);
+                                }
+                            }
+                            KeyCode::Char('s') => {
+                                if state.focus == Focus::Preview {
+                                    state.preview_scroll = state.preview_scroll.saturating_add(1);
+                                }
+                            }
+                            KeyCode::Home => {
+                                state.selected = 0;
+                                state.tree_scroll = 0;
+                            }
+                            KeyCode::End => {
+                                if !state.flat.is_empty() {
+                                    state.selected = state.flat.len() - 1;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    Event::Mouse(me) => {
+                        match me.kind {
+                            MouseEventKind::ScrollUp => {
+                                match state.focus {
+                                    Focus::Tree => state.tree_scroll = state.tree_scroll.saturating_sub(1),
+                                    Focus::Preview => state.preview_scroll = state.preview_scroll.saturating_sub(1),
+                                }
+                            }
+                            MouseEventKind::ScrollDown => {
+                                match state.focus {
+                                    Focus::Tree => state.tree_scroll = state.tree_scroll.saturating_add(1),
+                                    Focus::Preview => state.preview_scroll = state.preview_scroll.saturating_add(1),
+                                }
+                            }
                             _ => {}
                         }
                     }
@@ -848,6 +1010,7 @@ fn run_show_tui(state: &mut ShowState) -> Result<()> {
     })();
 
     disable_raw_mode()?;
+    execute!(term.backend_mut(), DisableMouseCapture)?;
     execute!(term.backend_mut(), LeaveAlternateScreen)?;
     term.show_cursor()?;
 
@@ -858,8 +1021,8 @@ fn draw_show_ui(f: &mut ratatui::Frame<'_>, state: &ShowState) {
     let size = f.area();
 
     let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
         .split(size);
 
     draw_tree_panel(f, chunks[0], state);
@@ -930,7 +1093,18 @@ fn draw_tree_panel(f: &mut ratatui::Frame<'_>, area: Rect, state: &ShowState) {
         }
     }
 
-    let paragraph = Paragraph::new(lines).block(block).wrap(Wrap { trim: false });
+    let inner_h = area.height.saturating_sub(2);
+    let scroll = clamp_scroll(state.tree_scroll, lines.len(), inner_h);
+    let scroll = if !state.flat.is_empty() {
+        ensure_visible(scroll, state.selected as u16, inner_h)
+    } else {
+        scroll
+    };
+
+    let paragraph = Paragraph::new(lines)
+        .block(block)
+        .wrap(Wrap { trim: false })
+        .scroll((scroll, 0));
     f.render_widget(paragraph, area);
 }
 
@@ -949,28 +1123,39 @@ fn draw_preview_panel(f: &mut ratatui::Frame<'_>, area: Rect, state: &ShowState)
     let mut lines: Vec<Line> = vec![];
 
     for s in &state.preview_lines {
-        // Heuristic: colorize `key=value` tokens.
-        let mut spans: Vec<Span> = Vec::new();
-        let parts: Vec<&str> = s.split(' ').collect();
-        let mut first = true;
-        for p in parts {
-            if !first {
-                spans.push(Span::raw(" "));
-            }
-            first = false;
-
-            if let Some((k, v)) = p.split_once('=') {
-                spans.push(Span::styled(format!("{k}="), Style::default().fg(Color::Yellow)));
-                spans.push(Span::styled(v.to_string(), Style::default().fg(Color::Green)));
-            } else {
-                spans.push(Span::raw(p.to_string()));
-            }
+        // Keep matrix/text preview lines untouched.
+        if s.starts_with("  ") || s.starts_with("preview") || s.starts_with("stats") || s.starts_with("ERROR") {
+            lines.push(Line::from(Span::raw(s.clone())));
+            continue;
         }
 
-        lines.push(Line::from(spans));
+        // Prefer "key = value" formatting (we generate it in preview_selected/renderers).
+        if let Some((k, v)) = s.split_once(" = ") {
+            lines.push(Line::from(vec![
+                Span::styled(k.to_string(), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                Span::raw(" = "),
+                Span::styled(v.to_string(), Style::default().fg(Color::Green)),
+            ]));
+        } else if let Some((k, v)) = s.split_once('=') {
+            // Backward compatibility for any remaining "key=value" lines.
+            lines.push(Line::from(vec![
+                Span::styled(k.to_string(), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                Span::raw(" = "),
+                Span::styled(v.trim().to_string(), Style::default().fg(Color::Green)),
+            ]));
+        } else {
+            // Fallback: raw line
+            lines.push(Line::from(Span::raw(s.clone())));
+        }
     }
 
-    let paragraph = Paragraph::new(lines).block(block).wrap(Wrap { trim: false });
+    let inner_h = area.height.saturating_sub(2);
+    let scroll = clamp_scroll(state.preview_scroll, lines.len(), inner_h);
+
+    let paragraph = Paragraph::new(lines)
+        .block(block)
+        .wrap(Wrap { trim: false })
+        .scroll((scroll, 0));
     f.render_widget(paragraph, area);
 }
 
@@ -1103,26 +1288,98 @@ fn render_numeric_preview(n: &NumericArray, max_elems: usize, rows: usize, cols:
                     row.push("?".into());
                 }
             }
-            out.push(format!("  {}", row.join("  ")));
+            out.push(format!("  {}", row.iter().map(|x| format!("{:>14}", x)).collect::<Vec<_>>().join(" ")));
+        }
+    } else if shape.len() == 3
+        && !n.complex
+        && (class_key == "double"
+            || class_key == "single"
+            || class_key == "int32"
+            || class_key == "uint64")
+    {
+        let r_total = shape[0];
+        let c_total = shape[1];
+        let k_total = shape[2];
+
+        let k_show = if r_total == 3 && c_total == 3 {
+            6.min(k_total)
+        } else {
+            5.min(k_total)
+        };
+
+        let r_show = rows.min(r_total);
+        let c_show = cols.min(c_total);
+
+        out.push(format!("preview (top-left {}x{}x{}):", r_show, c_show, k_show));
+
+        for k in 0..k_show {
+            out.push(format!("slice [{}]", k));
+
+            for r in 0..r_show {
+                let mut row = Vec::with_capacity(c_show);
+                for c in 0..c_show {
+                    let idx = r + c * r_total + k * r_total * c_total;
+                    let off = idx * elem_size;
+                    if off + elem_size <= n.real_le.len() {
+                        row.push(decode_scalar_to_string(
+                            &class_key,
+                            &n.real_le[off..off + elem_size],
+                        ));
+                    } else {
+                        row.push("?".into());
+                    }
+                }
+                out.push(format!(
+                    "  {}",
+                    row.iter()
+                        .map(|x| format!("{:>14}", x))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                ));
+            }
+
+            out.push("".to_string());
         }
     } else {
         let show = max_elems.min(numel);
         out.push(format!("preview (first {} elements):", show));
 
-        let mut line = String::new();
-        for i in 0..show {
-            let off = i * elem_size;
-            if off + elem_size <= n.real_le.len() {
-                line.push_str(&decode_scalar_to_string(
-                    &class_key,
-                    &n.real_le[off..off + elem_size],
-                ));
-            } else {
-                line.push('?');
+        if show <= 100 {
+            for i in 0..show {
+                let off = i * elem_size;
+                if off + elem_size <= n.real_le.len() {
+                    out.push(format!(
+                        "  [{:>4}] {}",
+                        i,
+                        decode_scalar_to_string(&class_key, &n.real_le[off..off + elem_size])
+                    ));
+                } else {
+                    out.push(format!("  [{:>4}] ?", i));
+                }
             }
-            line.push(' ');
+        } else {
+            let mut line = String::new();
+            for i in 0..show {
+                let off = i * elem_size;
+                if off + elem_size <= n.real_le.len() {
+                    line.push_str(&decode_scalar_to_string(
+                        &class_key,
+                        &n.real_le[off..off + elem_size],
+                    ));
+                } else {
+                    line.push('?');
+                }
+                line.push(' ');
+
+                if (i + 1) % 10 == 0 {
+                    out.push(format!("  {}", line.trim_end()));
+                    line.clear();
+                }
+            }
+            if !line.is_empty() {
+                out.push(format!("  {}", line.trim_end()));
+            }
         }
-        out.push(line.trim_end().to_string());
     }
 
     if stats && (class_key == "double" || class_key == "single") && !n.complex {

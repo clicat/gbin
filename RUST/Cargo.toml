@@ -2,8 +2,12 @@
 name = "gbin"
 version = "0.1.0"
 edition = "2021"
-license = "MIT OR Apache-2.0"
+license = "MIT"
 description = "Reader/writer for MATLAB Gbin GBF (GREDBIN) files."
+repository = "https://github.com/clicat/Gbin"
+readme = "README.md"
+keywords = ["matlab", "serialization", "binary", "json", "zlib"]
+categories = ["encoding", "parser-implementations"]
 
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }

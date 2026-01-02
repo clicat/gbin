@@ -26,7 +26,7 @@ Dependencies:
 - **zlib** (CMake: `find_package(ZLIB REQUIRED)`)
 
 ```bash
-cmake -S . -B build
+cmake -S . -B build -G Ninja
 cmake --build build -j
 ctest --test-dir build --output-on-failure
 ```

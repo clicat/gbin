@@ -367,6 +367,23 @@ static Json json_null() { return Json{nullptr}; }
 // Small helpers
 // ------------------------------
 
+static constexpr std::uint32_t kMaxHeaderLen   = 64u * 1024u * 1024u; // 64MB
+static constexpr std::uint64_t kMaxFieldUsize  = 16ull * 1024ull * 1024ull * 1024ull; // 16 GiB
+static constexpr std::uint64_t kMaxFieldCsize  = 16ull * 1024ull * 1024ull * 1024ull; // 16 GiB
+
+static bool checked_mul_size(std::size_t a, std::size_t b, std::size_t& out) {
+    if (a == 0 || b == 0) { out = 0; return true; }
+    if (a > (std::numeric_limits<std::size_t>::max)() / b) return false;
+    out = a * b;
+    return true;
+}
+
+static bool checked_add_u64(std::uint64_t a, std::uint64_t b, std::uint64_t& out) {
+    if (a > (std::numeric_limits<std::uint64_t>::max)() - b) return false;
+    out = a + b;
+    return true;
+}
+
 static std::uint32_t read_u32_le(std::istream& is) {
     std::array<unsigned char, 4> b{};
     is.read(reinterpret_cast<char*>(b.data()), 4);
@@ -463,15 +480,30 @@ static std::vector<std::size_t> shape_usize_from_u64(const std::vector<std::uint
 }
 
 std::size_t numel(const std::vector<std::size_t>& shape) {
+    if (shape.empty()) return 0;
     std::size_t n = 1;
-    for (auto d : shape) n *= d;
-    return shape.empty() ? 0 : n;
+    for (auto d : shape) {
+        if (d == 0) throw GbfError(ErrorKind::InvalidData, "shape contains zero dimension");
+        std::size_t tmp = 0;
+        if (!checked_mul_size(n, d, tmp)) throw GbfError(ErrorKind::InvalidData, "shape size overflow");
+        n = tmp;
+    }
+    return n;
 }
 
 std::size_t numel_u64(const std::vector<std::uint64_t>& shape) {
+    if (shape.empty()) return 0;
     std::size_t n = 1;
-    for (auto d : shape) n *= static_cast<std::size_t>(d);
-    return shape.empty() ? 0 : n;
+    for (auto d : shape) {
+        if (d == 0) throw GbfError(ErrorKind::InvalidData, "shape contains zero dimension");
+        if (d > static_cast<std::uint64_t>((std::numeric_limits<std::size_t>::max)())) {
+            throw GbfError(ErrorKind::InvalidData, "shape dimension overflow");
+        }
+        std::size_t tmp = 0;
+        if (!checked_mul_size(n, static_cast<std::size_t>(d), tmp)) throw GbfError(ErrorKind::InvalidData, "shape size overflow");
+        n = tmp;
+    }
+    return n;
 }
 
 static std::vector<std::string> split_path(const std::string& s) {
@@ -485,9 +517,12 @@ static std::vector<std::string> split_path(const std::string& s) {
         if (dot == s.size()) break;
     }
     // remove empty segments
-    parts.erase(std::remove_if(parts.begin(), parts.end(), [](const std::string& p){ return p.empty(); }), parts.end());
-    return parts;
-}
+    for (const auto& p : parts) {
+        if (p.empty()) {
+            throw GbfError(ErrorKind::InvalidData, "invalid path: empty segment");
+        }
+    }
+    return parts;}
 
 static std::string join_path(const std::vector<std::string>& parts, std::size_t upto) {
     std::string out;
@@ -569,6 +604,9 @@ static std::vector<std::uint8_t> zlib_compress(const std::vector<std::uint8_t>& 
 
 static std::vector<std::uint8_t> zlib_decompress(const std::vector<std::uint8_t>& in, std::size_t usize) {
     if (usize == 0) return {};
+    if (usize > static_cast<std::size_t>(kMaxFieldUsize)) {
+        throw GbfError(ErrorKind::InvalidData, "field usize exceeds configured limit");
+    }
     std::vector<std::uint8_t> out(usize);
     uLongf out_len = static_cast<uLongf>(usize);
     int rc = ::uncompress(reinterpret_cast<Bytef*>(out.data()), &out_len,
@@ -892,6 +930,25 @@ static std::vector<std::uint8_t> encode_value_bytes(const GbfValue& v, FieldMeta
         meta.shape.clear();
         for (auto d : a.shape) meta.shape.push_back(static_cast<std::uint64_t>(d));
 
+        const std::size_t elem = bytes_per_elem(a.class_id);
+        std::size_t expected_real = 0;
+        if (!checked_mul_size(numel(a.shape), elem, expected_real)) {
+            throw GbfError(ErrorKind::InvalidData, "numeric payload size overflow");
+        }
+        if (a.real_le.size() != expected_real) {
+            throw GbfError(ErrorKind::InvalidData, "numeric real_le size does not match shape/class");
+        }
+        if (!a.complex) {
+            if (a.imag_le.has_value() && !a.imag_le->empty()) {
+                throw GbfError(ErrorKind::InvalidData, "non-complex numeric must not have imag_le");
+            }
+        } else {
+            if (!a.imag_le) throw GbfError(ErrorKind::InvalidData, "complex numeric requires imag_le");
+            if (a.imag_le->size() != expected_real) {
+                throw GbfError(ErrorKind::InvalidData, "numeric imag_le size does not match shape/class");
+            }
+        }
+
         out = a.real_le;
         if (a.complex) {
             if (!a.imag_le) throw GbfError(ErrorKind::InvalidData, "complex numeric requires imag_le");
@@ -1133,25 +1190,28 @@ static GbfValue decode_value_bytes(const FieldMeta& meta, const std::vector<std:
         a.shape = shape;
         a.complex = meta.complex;
 
-        std::size_t elem = bytes_per_elem(a.class_id);
-        std::size_t expected_real = n * elem;
+        const std::size_t elem = bytes_per_elem(a.class_id);
+        std::size_t expected_real = 0;
+        if (!checked_mul_size(n, elem, expected_real)) {
+            throw GbfError(ErrorKind::InvalidData, "numeric expected size overflow");
+        }
+
         if (!a.complex) {
             if (bytes.size() != expected_real) {
-                // be tolerant; store raw anyway
-                a.real_le = bytes;
-            } else {
-                a.real_le = bytes;
+                throw GbfError(ErrorKind::InvalidData, "numeric payload size does not match shape/class");
             }
+            a.real_le = bytes;
         } else {
-            if (bytes.size() == expected_real * 2) {
-                a.real_le.assign(bytes.begin(), bytes.begin() + static_cast<std::ptrdiff_t>(expected_real));
-                std::vector<std::uint8_t> im(bytes.begin() + static_cast<std::ptrdiff_t>(expected_real), bytes.end());
-                a.imag_le = std::move(im);
-            } else {
-                // Unknown complex layout; store all in real_le as opaque
-                a.real_le = bytes;
-                a.imag_le = std::nullopt;
+            std::size_t expected_total = 0;
+            if (!checked_mul_size(expected_real, 2, expected_total)) {
+                throw GbfError(ErrorKind::InvalidData, "numeric expected size overflow");
             }
+            if (bytes.size() != expected_total) {
+                throw GbfError(ErrorKind::InvalidData, "complex numeric payload size does not match shape/class");
+            }
+            a.real_le.assign(bytes.begin(), bytes.begin() + static_cast<std::ptrdiff_t>(expected_real));
+            std::vector<std::uint8_t> im(bytes.begin() + static_cast<std::ptrdiff_t>(expected_real), bytes.end());
+            a.imag_le = std::move(im);
         }
         return GbfValue::make_numeric(a);
     }
@@ -1318,10 +1378,9 @@ static void insert_path(GbfValue& root, const std::string& path, const GbfValue&
         auto it = m.find(parts[i]);
         if (it == m.end()) {
             it = m.emplace(parts[i], GbfValue::make_struct()).first;
-        } else if (!it->second.is_struct()) {
-            // Overwrite non-struct with struct to allow nesting.
-            it->second = GbfValue::make_struct();
-        }
+            } else if (!it->second.is_struct()) {
+                throw GbfError(ErrorKind::InvalidData, "path hits non-struct at '" + join_path(parts, i + 1) + "'");
+            }
         cur = &it->second;
     }
 
@@ -1360,11 +1419,14 @@ std::tuple<Header, std::uint32_t, std::string> read_header_only(
     // trim trailing NULs
     while (!magic_s.empty() && magic_s.back() == '\0') magic_s.pop_back();
 
-    if (magic_s != "GREDBIN" && magic_s != "GRDCBIN" && magic_s != "GRDCBIN" && magic_s != "GRDCBIN") {
+    if (magic_s != "GREDBIN") {
         throw GbfError(ErrorKind::BadMagic, "bad magic: '" + magic_s + "'");
     }
 
     std::uint32_t header_len = read_u32_le(is);
+    if (header_len == 0 || header_len > kMaxHeaderLen) {
+        throw GbfError(ErrorKind::InvalidData, "unreasonable header length");
+    }
     std::string raw_json;
     raw_json.resize(header_len);
     is.read(&raw_json[0], header_len);
@@ -1382,6 +1444,15 @@ std::tuple<Header, std::uint32_t, std::string> read_header_only(
         actual_size = static_cast<std::uint64_t>(std::filesystem::file_size(file));
     } catch (...) {
         actual_size = 0;
+    }
+    if (actual_size != 0) {
+        std::uint64_t min_size = 0;
+        if (!checked_add_u64(8ull + 4ull, static_cast<std::uint64_t>(header_len), min_size)) {
+            throw GbfError(ErrorKind::InvalidData, "size overflow computing payload start");
+        }
+        if (actual_size < min_size) {
+            throw GbfError(ErrorKind::Truncated, "file too small for header length");
+        }
     }
     if (hdr.file_size == 0 && actual_size != 0) hdr.file_size = actual_size;
 
@@ -1408,8 +1479,20 @@ static std::vector<std::uint8_t> read_field_payload(
     if (f.csize == 0 || f.usize == 0) {
         return {};
     }
+    if (f.usize > kMaxFieldUsize || f.csize > kMaxFieldCsize) {
+        throw GbfError(ErrorKind::InvalidData, "field size exceeds configured limit");
+    }
 
-    std::uint64_t pos = hdr.payload_start + f.offset;
+    std::uint64_t pos = 0;
+    if (!checked_add_u64(hdr.payload_start, f.offset, pos)) {
+        throw GbfError(ErrorKind::InvalidData, "payload offset overflow");
+    }
+    if (hdr.file_size != 0) {
+        std::uint64_t end = 0;
+        if (!checked_add_u64(pos, f.csize, end) || end > hdr.file_size) {
+            throw GbfError(ErrorKind::Truncated, "field payload exceeds file bounds");
+        }
+    }
     is.seekg(static_cast<std::streamoff>(pos), std::ios::beg);
     if (!is) throw GbfError(ErrorKind::Io, "seek failed while reading payload");
 

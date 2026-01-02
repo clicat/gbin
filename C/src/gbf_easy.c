@@ -14,11 +14,14 @@
 //    converting to GBF storage format.
 
 #include "gbin/gbf_easy.h"
+#include "gbf_internal.h"
 
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
 #include <stdarg.h>
+#include <limits.h>
+#include <stdint.h>
 
 // ---------------------------
 // Local helpers
@@ -32,6 +35,16 @@ static void opaque_tmp_free(gbf_opaque_value_t* o) {
     free(o->encoding);
     free(o->bytes);
     free(o);
+}
+
+// C99-compatible string duplication that returns NULL on OOM.
+static char* gbf_easy_strdup(const char* s) {
+    if (!s) return NULL;
+    size_t n = strlen(s);
+    char* p = (char*)malloc(n + 1);
+    if (!p) return NULL;
+    memcpy(p, s, n + 1);
+    return p;
 }
 
 // ---------------------------
@@ -62,7 +75,7 @@ void gbf_easy_set_err(gbf_error_t* err, const char* fmt, ...) {
 
     // If it fit on the stack buffer, duplicate it.
     if ((size_t)n < sizeof(stack_buf)) {
-        err->message = strdup(stack_buf);
+        err->message = gbf_easy_strdup(stack_buf);
         return;
     }
 
@@ -77,6 +90,7 @@ void gbf_easy_set_err(gbf_error_t* err, const char* fmt, ...) {
 
     err->message = heap_buf;
 }
+
 // ---------------------------
 // Local value constructors
 // ---------------------------
@@ -153,11 +167,53 @@ const char* gbf_easy_numeric_class_name(gbf_numeric_class_t c) {
     }
 }
 
-static size_t shape_numel_sz(const size_t* shape, size_t shape_len) {
-    if (!shape || shape_len == 0) return 0;
+
+static int checked_mul_size(size_t a, size_t b, size_t* out) {
+    return gbf_checked_mul_size(a, b, out);
+}
+
+static int shape_numel_checked(const size_t* shape, size_t shape_len, size_t* out_numel) {
+    if (!shape || shape_len == 0 || !out_numel) return 0;
     size_t n = 1;
-    for (size_t i = 0; i < shape_len; i++) n *= shape[i];
-    return n;
+    for (size_t i = 0; i < shape_len; i++) {
+        // Policy: forbid zero-sized dimensions in the easy layer.
+        if (shape[i] == 0) return 0;
+        if (!checked_mul_size(n, shape[i], &n)) return 0;
+    }
+    *out_numel = n;
+    return 1;
+}
+
+static int shape_total_bytes_checked(const size_t* shape, size_t shape_len, size_t elem_size, size_t* out_numel, size_t* out_total) {
+    if (!out_numel || !out_total) return 0;
+    size_t n = 0;
+    if (!shape_numel_checked(shape, shape_len, &n)) return 0;
+    size_t total = 0;
+    if (!checked_mul_size(n, elem_size, &total)) return 0;
+    // With the policy above, total==0 only happens on overflow or elem_size==0.
+    if (total == 0) return 0;
+    *out_numel = n;
+    *out_total = total;
+    return 1;
+}
+
+// Endianness helpers for numeric payload normalization.
+static int gbf_easy_is_little_endian(void) {
+    const uint16_t x = 1;
+    return *((const uint8_t*)&x) == 1;
+}
+
+static void gbf_easy_bswap_inplace(uint8_t* buf, size_t elem_size, size_t n_elems) {
+    if (!buf || elem_size <= 1 || n_elems == 0) return;
+
+    for (size_t i = 0; i < n_elems; i++) {
+        uint8_t* p = buf + i * elem_size;
+        for (size_t a = 0, b = elem_size - 1; a < b; a++, b--) {
+            uint8_t t = p[a];
+            p[a] = p[b];
+            p[b] = t;
+        }
+    }
 }
 
 // Convert row-major typed data into GBF column-major order.
@@ -176,9 +232,18 @@ static int to_col_major_bytes(
         gbf_easy_set_err(err, "invalid arguments");
         return 0;
     }
+    // Validate layout.
+    if (layout != GBF_EASY_COL_MAJOR && layout != GBF_EASY_ROW_MAJOR) {
+        gbf_easy_set_err(err, "invalid layout");
+        return 0;
+    }
 
-    size_t n = shape_numel_sz(shape, shape_len);
-    size_t total = n * elem_size;
+    size_t n = 0;
+    size_t total = 0;
+    if (!shape_total_bytes_checked(shape, shape_len, elem_size, &n, &total)) {
+        gbf_easy_set_err(err, "invalid shape or size overflow");
+        return 0;
+    }
 
     uint8_t* dst = (uint8_t*)malloc(total);
     if (!dst) {
@@ -189,6 +254,9 @@ static int to_col_major_bytes(
     // If already column-major, just memcpy.
     if (layout == GBF_EASY_COL_MAJOR) {
         memcpy(dst, src, total);
+        if (!gbf_easy_is_little_endian()) {
+            gbf_easy_bswap_inplace(dst, elem_size, n);
+        }
         *out = dst;
         *out_len = total;
         return 1;
@@ -198,6 +266,9 @@ static int to_col_major_bytes(
     // For 1D, it's identical.
     if (shape_len == 1) {
         memcpy(dst, src, total);
+        if (!gbf_easy_is_little_endian()) {
+            gbf_easy_bswap_inplace(dst, elem_size, n);
+        }
         *out = dst;
         *out_len = total;
         return 1;
@@ -223,12 +294,24 @@ static int to_col_major_bytes(
     // row strides
     rstride[shape_len - 1] = 1;
     for (size_t k = shape_len - 1; k-- > 0;) {
-        rstride[k] = rstride[k + 1] * shape[k + 1];
+        if (!checked_mul_size(rstride[k + 1], shape[k + 1], &rstride[k])) {
+            free(dst);
+            free(rstride);
+            free(cstride);
+            gbf_easy_set_err(err, "stride overflow");
+            return 0;
+        }
     }
     // col strides
     cstride[0] = 1;
     for (size_t k = 1; k < shape_len; k++) {
-        cstride[k] = cstride[k - 1] * shape[k - 1];
+        if (!checked_mul_size(cstride[k - 1], shape[k - 1], &cstride[k])) {
+            free(dst);
+            free(rstride);
+            free(cstride);
+            gbf_easy_set_err(err, "stride overflow");
+            return 0;
+        }
     }
 
     // Iterate all elements via a mixed radix counter
@@ -263,6 +346,9 @@ static int to_col_major_bytes(
     free(rstride);
     free(cstride);
 
+    if (!gbf_easy_is_little_endian()) {
+        gbf_easy_bswap_inplace(dst, elem_size, n);
+    }
     *out = dst;
     *out_len = total;
     return 1;
@@ -291,6 +377,37 @@ gbf_easy_entry_t gbf_easy_numeric_bytes_nd(
         return make_entry_err(name, err, "invalid numeric bytes args");
     }
 
+    // Validate shape/size consistency to prevent mismatched buffers and overflows.
+    size_t elem_size = gbf_easy_numeric_elem_size(class_id);
+    if (elem_size == 0) {
+        return make_entry_err(name, err, "invalid numeric class");
+    }
+
+    size_t n = 0;
+    size_t expected = 0;
+    if (!shape_total_bytes_checked(shape, shape_len, elem_size, &n, &expected)) {
+        return make_entry_err(name, err, "invalid shape or size overflow");
+    }
+
+    if (real_len != expected) {
+        gbf_easy_set_err(err, "numeric real_len (%zu) does not match expected (%zu)", real_len, expected);
+        return (gbf_easy_entry_t){ name, NULL };
+    }
+
+    if (complex) {
+        if (!imag_le || imag_len == 0) {
+            return make_entry_err(name, err, "complex numeric requires imag buffer");
+        }
+        if (imag_len != expected) {
+            gbf_easy_set_err(err, "numeric imag_len (%zu) does not match expected (%zu)", imag_len, expected);
+            return (gbf_easy_entry_t){ name, NULL };
+        }
+    } else {
+        if (imag_le != NULL || imag_len != 0) {
+            return make_entry_err(name, err, "non-complex numeric must not provide imag buffer");
+        }
+    }
+
     gbf_numeric_array_t* a = (gbf_numeric_array_t*)calloc(1, sizeof(gbf_numeric_array_t));
     if (!a) return make_entry_err(name, err, "oom");
 
@@ -305,7 +422,7 @@ gbf_easy_entry_t gbf_easy_numeric_bytes_nd(
     }
     memcpy(a->shape, shape, shape_len * sizeof(size_t));
 
-    // ownership policy: COPY => copy buffers; TAKE => take ownership.
+    // Ownership policy: COPY duplicates buffers; TAKE assumes ownership of the provided pointers.
     if (ownership == GBF_EASY_TAKE) {
         a->real_le = (uint8_t*)real_le;
         a->real_len = real_len;
@@ -355,23 +472,53 @@ gbf_easy_entry_t gbf_easy_f64_nd(
     gbf_easy_ownership_t ownership,
     gbf_error_t* err)
 {
-    (void)ownership; // ownership only matters if we needed to take over conversion buffers; we always allocate new bytes.
     if (!name || !data || !shape || shape_len == 0) {
         return make_entry_err(name, err, "invalid f64 args");
     }
 
-    size_t esz = 8;
+    const size_t esz = 8;
+
+    // If the caller transfers ownership and the input is already in GBF storage layout
+    // on a little-endian host, we can avoid allocating a conversion buffer.
+    if (ownership == GBF_EASY_TAKE && layout == GBF_EASY_COL_MAJOR && gbf_easy_is_little_endian()) {
+        size_t n = 0;
+        size_t bytes_len = 0;
+        if (!shape_total_bytes_checked(shape, shape_len, esz, &n, &bytes_len)) {
+            return make_entry_err(name, err, "invalid shape or size overflow");
+        }
+        return gbf_easy_numeric_bytes_nd(
+            name,
+            GBF_NUM_DOUBLE,
+            shape, shape_len,
+            0,
+            data, bytes_len,
+            NULL, 0,
+            GBF_EASY_TAKE,
+            err);
+    }
+
     uint8_t* bytes = NULL;
     size_t bytes_len = 0;
     if (!to_col_major_bytes(data, esz, shape, shape_len, layout, &bytes, &bytes_len, err)) {
         return (gbf_easy_entry_t){ name, NULL };
     }
 
-    // numeric bytes are host-endian doubles; GBF expects little-endian. On little-endian hosts this is ok.
-    // For portability, the core library should treat these as host->LE conversion, but we store raw and
-    // rely on gbf_value_make_numeric() conventions used across the project.
+    // If the caller transferred ownership but a conversion buffer was required,
+    // free the original input now that we've materialized the normalized payload.
+    if (ownership == GBF_EASY_TAKE) {
+        free((void*)data);
+    }
 
-    return gbf_easy_numeric_bytes_nd(name, GBF_NUM_DOUBLE, shape, shape_len, 0, bytes, bytes_len, NULL, 0, GBF_EASY_TAKE, err);
+    // Payload is normalized to little-endian in to_col_major_bytes().
+    return gbf_easy_numeric_bytes_nd(
+        name,
+        GBF_NUM_DOUBLE,
+        shape, shape_len,
+        0,
+        bytes, bytes_len,
+        NULL, 0,
+        GBF_EASY_TAKE,
+        err);
 }
 
 gbf_easy_entry_t gbf_easy_f64_matrix(
@@ -396,7 +543,7 @@ gbf_easy_entry_t gbf_easy_f32_nd(
         return make_entry_err(name, err, "invalid f32 args");
     }
 
-    size_t esz = 4;
+    const size_t esz = 4;
     uint8_t* bytes = NULL;
     size_t bytes_len = 0;
     if (!to_col_major_bytes(data, esz, shape, shape_len, layout, &bytes, &bytes_len, err)) {
@@ -417,7 +564,7 @@ gbf_easy_entry_t gbf_easy_i32_nd(
         return make_entry_err(name, err, "invalid i32 args");
     }
 
-    size_t esz = 4;
+    const size_t esz = 4;
     uint8_t* bytes = NULL;
     size_t bytes_len = 0;
     if (!to_col_major_bytes(data, esz, shape, shape_len, layout, &bytes, &bytes_len, err)) {
@@ -438,7 +585,7 @@ gbf_easy_entry_t gbf_easy_u64_nd(
         return make_entry_err(name, err, "invalid u64 args");
     }
 
-    size_t esz = 8;
+    const size_t esz = 8;
     uint8_t* bytes = NULL;
     size_t bytes_len = 0;
     if (!to_col_major_bytes(data, esz, shape, shape_len, layout, &bytes, &bytes_len, err)) {
@@ -459,7 +606,10 @@ gbf_easy_entry_t gbf_easy_logical_nd(
         return make_entry_err(name, err, "invalid logical args");
     }
 
-    size_t n = shape_numel_sz(shape, shape_len);
+    size_t n = 0;
+    if (!shape_numel_checked(shape, shape_len, &n)) {
+        return make_entry_err(name, err, "invalid shape or size overflow");
+    }
 
     gbf_logical_array_t* a = (gbf_logical_array_t*)calloc(1, sizeof(gbf_logical_array_t));
     if (!a) return make_entry_err(name, err, "oom");
@@ -497,9 +647,18 @@ gbf_easy_entry_t gbf_easy_string_nd(
     gbf_easy_ownership_t ownership,
     gbf_error_t* err)
 {
-    (void)ownership;
     if (!name || !shape || shape_len == 0) {
         return make_entry_err(name, err, "invalid string args");
+    }
+
+    // Require that the provided element count matches the declared shape.
+    size_t expected_n = 0;
+    if (!shape_numel_checked(shape, shape_len, &expected_n)) {
+        return make_entry_err(name, err, "invalid shape or size overflow");
+    }
+    if (n != expected_n) {
+        gbf_easy_set_err(err, "string n (%zu) does not match expected (%zu)", n, expected_n);
+        return (gbf_easy_entry_t){ name, NULL };
     }
 
     gbf_string_array_t* a = (gbf_string_array_t*)calloc(1, sizeof(gbf_string_array_t));
@@ -517,8 +676,14 @@ gbf_easy_entry_t gbf_easy_string_nd(
     for (size_t i = 0; i < n; i++) {
         if (!utf8_or_null || !utf8_or_null[i]) {
             a->data[i] = NULL;
+            continue;
+        }
+
+        if (ownership == GBF_EASY_TAKE) {
+            // Caller transfers ownership of the pointer.
+            a->data[i] = utf8_or_null[i];
         } else {
-            a->data[i] = strdup(utf8_or_null[i]);
+            a->data[i] = gbf_easy_strdup(utf8_or_null[i]);
             if (!a->data[i]) {
                 for (size_t j = 0; j < i; j++) free(a->data[j]);
                 free(a->data);
@@ -553,6 +718,16 @@ gbf_easy_entry_t gbf_easy_char_utf16_nd(
 {
     if (!name || !shape || shape_len == 0) {
         return make_entry_err(name, err, "invalid char args");
+    }
+
+    // Require that the provided unit count matches the declared shape.
+    size_t expected_n = 0;
+    if (!shape_numel_checked(shape, shape_len, &expected_n)) {
+        return make_entry_err(name, err, "invalid shape or size overflow");
+    }
+    if (n_units != expected_n) {
+        gbf_easy_set_err(err, "char n_units (%zu) does not match expected (%zu)", n_units, expected_n);
+        return (gbf_easy_entry_t){ name, NULL };
     }
 
     gbf_char_array_t* a = (gbf_char_array_t*)calloc(1, sizeof(gbf_char_array_t));
@@ -594,15 +769,14 @@ gbf_easy_entry_t gbf_easy_opaque_bytes_nd(
     gbf_easy_ownership_t ownership,
     gbf_error_t* err)
 {
-    (void)ownership;
     if (!name || !bytes) return make_entry_err(name, err, "invalid opaque args");
 
     gbf_opaque_value_t* o = (gbf_opaque_value_t*)calloc(1, sizeof(gbf_opaque_value_t));
     if (!o) return make_entry_err(name, err, "oom");
 
-    o->kind = kind ? strdup(kind) : NULL;
-    o->class_name = class_name ? strdup(class_name) : NULL;
-    o->encoding = encoding ? strdup(encoding) : NULL;
+    o->kind = kind ? gbf_easy_strdup(kind) : NULL;
+    o->class_name = class_name ? gbf_easy_strdup(class_name) : NULL;
+    o->encoding = encoding ? gbf_easy_strdup(encoding) : NULL;
     o->complex = complex ? 1 : 0;
 
     if (shape && shape_len) {
@@ -612,26 +786,19 @@ gbf_easy_entry_t gbf_easy_opaque_bytes_nd(
         memcpy(o->shape, shape, shape_len * sizeof(size_t));
     }
 
-    o->bytes = (uint8_t*)malloc(bytes_len);
-    if (!o->bytes) {
-        if (o->kind) free(o->kind);
-        if (o->class_name) free(o->class_name);
-        if (o->encoding) free(o->encoding);
-        if (o->shape) free(o->shape);
-        free(o);
-        return make_entry_err(name, err, "oom");
+    if (ownership == GBF_EASY_TAKE) {
+        o->bytes = (uint8_t*)bytes;
+        o->bytes_len = bytes_len;
+    } else {
+        o->bytes = (uint8_t*)malloc(bytes_len);
+        if (!o->bytes) { opaque_tmp_free(o); return make_entry_err(name, err, "oom"); }
+        memcpy(o->bytes, bytes, bytes_len);
+        o->bytes_len = bytes_len;
     }
-    memcpy(o->bytes, bytes, bytes_len);
-    o->bytes_len = bytes_len;
 
     gbf_value_t* v = (gbf_value_t*)calloc(1, sizeof(gbf_value_t));
     if (!v) {
-        if (o->kind) free(o->kind);
-        if (o->class_name) free(o->class_name);
-        if (o->encoding) free(o->encoding);
-        if (o->shape) free(o->shape);
-        if (o->bytes) free(o->bytes);
-        free(o);
+        opaque_tmp_free(o);
         return make_entry_err(name, err, "failed to create opaque value");
     }
     v->kind = GBF_VALUE_OPAQUE;
@@ -683,13 +850,16 @@ const gbf_value_t* gbf_easy_get(const gbf_value_t* root, const char* dot_path) {
         const char* seg_end = strchr(p, '.');
         size_t seg_len = seg_end ? (size_t)(seg_end - seg_start) : strlen(seg_start);
 
-        char key[256];
-        if (seg_len >= sizeof(key)) return NULL;
+        if (seg_len == 0) return NULL;
+        if (seg_len > SIZE_MAX - 1) return NULL;
+        char* key = (char*)malloc(seg_len + 1);
+        if (!key) return NULL;
         memcpy(key, seg_start, seg_len);
         key[seg_len] = '\0';
 
         const gbf_struct_t* st = &cur->as.s;
         const gbf_value_t* next = gbf_easy_struct_get(st, key);
+        free(key);
         if (!next) return NULL;
 
         cur = next;
@@ -741,9 +911,14 @@ static int struct_insert_by_path(gbf_value_t* root_struct_value, const char* pat
         const char* seg_end = strchr(p, '.');
         size_t seg_len = seg_end ? (size_t)(seg_end - p) : strlen(p);
 
-        char key[256];
-        if (seg_len == 0 || seg_len >= sizeof(key)) {
+        if (seg_len == 0 || seg_len > SIZE_MAX - 1) {
             gbf_easy_set_err(err, "invalid path segment");
+            return 0;
+        }
+
+        char* key = (char*)malloc(seg_len + 1);
+        if (!key) {
+            gbf_easy_set_err(err, "oom");
             return 0;
         }
         memcpy(key, p, seg_len);
@@ -751,10 +926,13 @@ static int struct_insert_by_path(gbf_value_t* root_struct_value, const char* pat
 
         if (!seg_end) {
             // leaf
-            if (!gbf_struct_set(cur_v, key, leaf, err)) {
+            int ok = gbf_struct_set(cur_v, key, leaf, err);
+            if (!ok) {
                 gbf_easy_set_err(err, "failed to set leaf '%s'", key);
+                free(key);
                 return 0;
             }
+            free(key);
             return 1;
         }
 
@@ -765,11 +943,13 @@ static int struct_insert_by_path(gbf_value_t* root_struct_value, const char* pat
             gbf_value_t* stv = gbf_value_new_struct();
             if (!stv) {
                 gbf_easy_set_err(err, "oom");
+                free(key);
                 return 0;
             }
             if (!gbf_struct_set(cur_v, key, stv, err)) {
                 gbf_value_free(stv);
                 gbf_easy_set_err(err, "failed to create struct '%s'", key);
+                free(key);
                 return 0;
             }
             child = stv;
@@ -777,9 +957,11 @@ static int struct_insert_by_path(gbf_value_t* root_struct_value, const char* pat
 
         if (child->kind != GBF_VALUE_STRUCT) {
             gbf_easy_set_err(err, "path '%s' hits non-struct", key);
+            free(key);
             return 0;
         }
 
+        free(key);
         cur_v = child;
         p = seg_end + 1;
     }
