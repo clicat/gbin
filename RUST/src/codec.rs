@@ -981,11 +981,14 @@ fn read_header_and_json(file: &mut File, opts: &ReadOptions) -> Result<(Header, 
 }
 
 fn field_payload_start(header_len: u32, header_payload_start: u64) -> u64 {
-    if header_payload_start > 0 {
-        header_payload_start
-    } else {
-        8u64 + 4u64 + header_len as u64
-    }
+    // The payload always begins immediately after the magic (8 B) + the
+    // header_len prefix (4 B) + the JSON header itself (header_len B).
+    // Recent MATLAB writers store an off-by-one `payload_start` in the
+    // JSON (1-indexed instead of 0-indexed) which silently corrupts every
+    // field read by 1 byte. The computed value is authoritative — the
+    // header field is redundant.
+    let _ = header_payload_start; // intentionally ignored — see comment above
+    8u64 + 4u64 + header_len as u64
 }
 
 fn read_field_raw(file: &mut File, payload_start: u64, field: &FieldMeta) -> Result<Vec<u8>> {
