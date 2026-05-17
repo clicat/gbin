@@ -1,11 +1,11 @@
 use crate::error::{GbfError, Result};
 use crate::header::{
-    compute_crc32, compute_header_crc32_hex_from_original_json, validate_header_crc, FieldMeta, Header,
-    MAGIC_BYTES, VERSION,
+    compute_crc32, compute_header_crc32_hex_from_original_json, validate_header_crc, FieldMeta,
+    Header, MAGIC_BYTES, VERSION,
 };
 use crate::value::{
-    CalendarDurationArray, CategoricalArray, CharArray, DateTimeArray, DurationArray,
-    GbfValue, LogicalArray, NumericArray, NumericClass, StringArray,
+    CalendarDurationArray, CategoricalArray, CharArray, DateTimeArray, DurationArray, GbfValue,
+    LogicalArray, NumericArray, NumericClass, StringArray,
 };
 use flate2::read::ZlibDecoder;
 use flate2::write::ZlibEncoder;
@@ -103,7 +103,8 @@ fn element_count_checked(shape: &[usize]) -> Result<usize> {
 }
 
 fn u64_to_usize(v: u64, what: &str) -> Result<usize> {
-    usize::try_from(v).map_err(|_| GbfError::Unsupported(format!("{} too large for this platform", what)))
+    usize::try_from(v)
+        .map_err(|_| GbfError::Unsupported(format!("{} too large for this platform", what)))
 }
 
 fn normalize_path<P: AsRef<Path>>(path: P) -> PathBuf {
@@ -130,7 +131,10 @@ fn write_u32_le<W: Write>(w: &mut W, v: u32) -> Result<()> {
 /// Read and parse the GBF header (and return the raw header JSON) without decoding any payload.
 ///
 /// This is intended for CLI/header inspection use-cases.
-pub fn read_header_only<P: AsRef<Path>>(path: P, opts: ReadOptions) -> Result<(Header, u32, String)> {
+pub fn read_header_only<P: AsRef<Path>>(
+    path: P,
+    opts: ReadOptions,
+) -> Result<(Header, u32, String)> {
     let path = normalize_path(path);
     let mut file = File::open(&path)?;
     read_header_and_json(&mut file, &opts)
@@ -183,17 +187,25 @@ fn zlib_decompress(comp: &[u8], max_out: u64) -> Result<Vec<u8>> {
     let mut limited = dec.take(max_out.saturating_add(1));
     limited.read_to_end(&mut out)?;
     if out.len() as u64 > max_out {
-        return Err(GbfError::Format("decompressed data exceeds configured limit".to_string()));
+        return Err(GbfError::Format(
+            "decompressed data exceeds configured limit".to_string(),
+        ));
     }
     Ok(out)
 }
 
 fn now_utc_string() -> String {
     let fmt = format_description!("[year]-[month]-[day]T[hour]:[minute]:[second]Z");
-    OffsetDateTime::now_utc().format(&fmt).unwrap_or_else(|_| "".to_string())
+    OffsetDateTime::now_utc()
+        .format(&fmt)
+        .unwrap_or_else(|_| "".to_string())
 }
 
-fn assign_by_path(root: &mut BTreeMap<String, GbfValue>, path: &str, value: GbfValue) -> Result<()> {
+fn assign_by_path(
+    root: &mut BTreeMap<String, GbfValue>,
+    path: &str,
+    value: GbfValue,
+) -> Result<()> {
     if path.is_empty() {
         return Err(GbfError::Format("empty field name".to_string()));
     }
@@ -209,7 +221,9 @@ fn assign_by_path(root: &mut BTreeMap<String, GbfValue>, path: &str, value: GbfV
             return Ok(());
         }
 
-        let entry = cur.entry(part.to_string()).or_insert_with(|| GbfValue::Struct(BTreeMap::new()));
+        let entry = cur
+            .entry(part.to_string())
+            .or_insert_with(|| GbfValue::Struct(BTreeMap::new()));
         match entry {
             GbfValue::Struct(m) => cur = m,
             _ => {
@@ -223,7 +237,11 @@ fn assign_by_path(root: &mut BTreeMap<String, GbfValue>, path: &str, value: GbfV
     Ok(())
 }
 
-fn flatten_to_leaves(value: &GbfValue, prefix: &str, out: &mut Vec<(String, GbfValue)>) -> Result<()> {
+fn flatten_to_leaves(
+    value: &GbfValue,
+    prefix: &str,
+    out: &mut Vec<(String, GbfValue)>,
+) -> Result<()> {
     match value {
         GbfValue::Struct(map) => {
             // In MATLAB, non-empty scalar structs are expanded into leaves.
@@ -245,14 +263,21 @@ fn flatten_to_leaves(value: &GbfValue, prefix: &str, out: &mut Vec<(String, GbfV
             Ok(())
         }
         other => {
-            let name = if prefix.is_empty() { "data".to_string() } else { prefix.to_string() };
+            let name = if prefix.is_empty() {
+                "data".to_string()
+            } else {
+                prefix.to_string()
+            };
             out.push((name, other.clone()));
             Ok(())
         }
     }
 }
 
-fn encode_leaf(name: &str, value: &GbfValue) -> Result<(Vec<u8>, String, String, Vec<u64>, bool, String)> {
+fn encode_leaf(
+    name: &str,
+    value: &GbfValue,
+) -> Result<(Vec<u8>, String, String, Vec<u64>, bool, String)> {
     // returns: raw_bytes, kind, class_name, shape, complex, encoding
     match value {
         GbfValue::Numeric(arr) => {
@@ -263,7 +288,9 @@ fn encode_leaf(name: &str, value: &GbfValue) -> Result<(Vec<u8>, String, String,
             if arr.real_le.len() != expected {
                 return Err(GbfError::Format(format!(
                     "numeric `{}` real_le size mismatch: expected {} bytes, got {}",
-                    name, expected, arr.real_le.len()
+                    name,
+                    expected,
+                    arr.real_le.len()
                 )));
             }
 
@@ -276,12 +303,17 @@ fn encode_leaf(name: &str, value: &GbfValue) -> Result<(Vec<u8>, String, String,
                 }
             } else {
                 let imag = arr.imag_le.as_ref().ok_or_else(|| {
-                    GbfError::Format(format!("numeric array `{}` is complex but imag_le is None", name))
+                    GbfError::Format(format!(
+                        "numeric array `{}` is complex but imag_le is None",
+                        name
+                    ))
                 })?;
                 if imag.len() != expected {
                     return Err(GbfError::Format(format!(
                         "numeric `{}` imag_le size mismatch: expected {} bytes, got {}",
-                        name, expected, imag.len()
+                        name,
+                        expected,
+                        imag.len()
                     )));
                 }
             }
@@ -332,7 +364,10 @@ fn encode_leaf(name: &str, value: &GbfValue) -> Result<(Vec<u8>, String, String,
             if a.data.len() != n {
                 return Err(GbfError::Format(format!(
                     "string `{}` shape {:?} implies N={}, but data.len={}",
-                    name, a.shape, n, a.data.len()
+                    name,
+                    a.shape,
+                    n,
+                    a.data.len()
                 )));
             }
 
@@ -479,7 +514,11 @@ fn encode_leaf(name: &str, value: &GbfValue) -> Result<(Vec<u8>, String, String,
         }
         GbfValue::CalendarDuration(a) => {
             let n = element_count_checked(&a.shape)?;
-            if a.is_missing.len() != n || a.months.len() != n || a.days.len() != n || a.time_ms.len() != n {
+            if a.is_missing.len() != n
+                || a.months.len() != n
+                || a.days.len() != n
+                || a.time_ms.len() != n
+            {
                 return Err(GbfError::Format(format!(
                     "calendarDuration `{}` inconsistent lengths for shape {:?}",
                     name, a.shape
@@ -514,9 +553,8 @@ fn encode_leaf(name: &str, value: &GbfValue) -> Result<(Vec<u8>, String, String,
                     name, a.shape
                 )));
             }
-            let n_cats = u32::try_from(a.categories.len()).map_err(|_| {
-                GbfError::Unsupported(format!("too many categories in `{}`", name))
-            })?;
+            let n_cats = u32::try_from(a.categories.len())
+                .map_err(|_| GbfError::Unsupported(format!("too many categories in `{}`", name)))?;
 
             let mut raw = Vec::new();
             raw.extend_from_slice(&n_cats.to_le_bytes());
@@ -544,16 +582,14 @@ fn encode_leaf(name: &str, value: &GbfValue) -> Result<(Vec<u8>, String, String,
                 "cats-utf8+codes-u32".to_string(),
             ))
         }
-        GbfValue::EmptyStruct => {
-            Ok((
-                Vec::new(),
-                "struct".to_string(),
-                "struct".to_string(),
-                vec![1, 1],
-                false,
-                "empty-scalar-struct".to_string(),
-            ))
-        }
+        GbfValue::EmptyStruct => Ok((
+            Vec::new(),
+            "struct".to_string(),
+            "struct".to_string(),
+            vec![1, 1],
+            false,
+            "empty-scalar-struct".to_string(),
+        )),
         GbfValue::Struct(_) => Err(GbfError::Unsupported(format!(
             "non-leaf struct encountered at `{}`; structs must be flattened before encoding",
             name
@@ -574,8 +610,9 @@ fn decode_leaf(field: &FieldMeta, raw: &[u8]) -> Result<GbfValue> {
         "struct" => Ok(GbfValue::EmptyStruct),
 
         "numeric" => {
-            let cls = NumericClass::from_matlab_class(&field.class_name)
-                .ok_or_else(|| GbfError::Unsupported(format!("unknown numeric class `{}`", field.class_name)))?;
+            let cls = NumericClass::from_matlab_class(&field.class_name).ok_or_else(|| {
+                GbfError::Unsupported(format!("unknown numeric class `{}`", field.class_name))
+            })?;
 
             let bpe = cls.bytes_per_element();
             let part_bytes = mul_usize(n, bpe)?;
@@ -584,7 +621,9 @@ fn decode_leaf(field: &FieldMeta, raw: &[u8]) -> Result<GbfValue> {
                 if raw.len() != part_bytes {
                     return Err(GbfError::Format(format!(
                         "numeric `{}` size mismatch: expected {} bytes, got {}",
-                        field.name, part_bytes, raw.len()
+                        field.name,
+                        part_bytes,
+                        raw.len()
                     )));
                 }
                 Ok(GbfValue::Numeric(NumericArray::new_real(
@@ -613,7 +652,9 @@ fn decode_leaf(field: &FieldMeta, raw: &[u8]) -> Result<GbfValue> {
             if raw.len() != n {
                 return Err(GbfError::Format(format!(
                     "logical `{}` size mismatch: expected {} bytes, got {}",
-                    field.name, n, raw.len()
+                    field.name,
+                    n,
+                    raw.len()
                 )));
             }
             Ok(GbfValue::Logical(LogicalArray {
@@ -654,7 +695,8 @@ fn decode_leaf(field: &FieldMeta, raw: &[u8]) -> Result<GbfValue> {
                 let miss_flag = raw[idx];
                 idx += 1;
 
-                let len = u32::from_le_bytes([raw[idx], raw[idx + 1], raw[idx + 2], raw[idx + 3]]) as usize;
+                let len = u32::from_le_bytes([raw[idx], raw[idx + 1], raw[idx + 2], raw[idx + 3]])
+                    as usize;
                 idx += 4;
 
                 if idx + len > raw.len() {
@@ -670,8 +712,9 @@ fn decode_leaf(field: &FieldMeta, raw: &[u8]) -> Result<GbfValue> {
                 if miss_flag != 0 {
                     data.push(None);
                 } else {
-                    let s = std::str::from_utf8(bytes)
-                        .map_err(|e| GbfError::Format(format!("string `{}` invalid UTF-8: {}", field.name, e)))?;
+                    let s = std::str::from_utf8(bytes).map_err(|e| {
+                        GbfError::Format(format!("string `{}` invalid UTF-8: {}", field.name, e))
+                    })?;
                     data.push(Some(s.to_string()));
                 }
             }
@@ -689,52 +732,88 @@ fn decode_leaf(field: &FieldMeta, raw: &[u8]) -> Result<GbfValue> {
             // [Y N int16][M N u8][D N u8][ms_day N int32]
             let mut idx = 0usize;
             if raw.len() < 1 + 4 + 4 + 4 {
-                return Err(GbfError::Format(format!("datetime `{}` payload too small", field.name)));
+                return Err(GbfError::Format(format!(
+                    "datetime `{}` payload too small",
+                    field.name
+                )));
             }
             let flags = raw[idx];
             idx += 1;
 
-            let tz_len = u32::from_le_bytes([raw[idx], raw[idx + 1], raw[idx + 2], raw[idx + 3]]) as usize;
+            let tz_len =
+                u32::from_le_bytes([raw[idx], raw[idx + 1], raw[idx + 2], raw[idx + 3]]) as usize;
             idx += 4;
             if idx + tz_len > raw.len() {
-                return Err(GbfError::Format(format!("datetime `{}` truncated tz", field.name)));
+                return Err(GbfError::Format(format!(
+                    "datetime `{}` truncated tz",
+                    field.name
+                )));
             }
             let tz_bytes = &raw[idx..idx + tz_len];
             idx += tz_len;
             let tz = if tz_len > 0 {
-                Some(std::str::from_utf8(tz_bytes).map_err(|e| {
-                    GbfError::Format(format!("datetime `{}` tz invalid UTF-8: {}", field.name, e))
-                })?.to_string())
+                Some(
+                    std::str::from_utf8(tz_bytes)
+                        .map_err(|e| {
+                            GbfError::Format(format!(
+                                "datetime `{}` tz invalid UTF-8: {}",
+                                field.name, e
+                            ))
+                        })?
+                        .to_string(),
+                )
             } else {
                 None
             };
 
-            let loc_len = u32::from_le_bytes([raw[idx], raw[idx + 1], raw[idx + 2], raw[idx + 3]]) as usize;
+            let loc_len =
+                u32::from_le_bytes([raw[idx], raw[idx + 1], raw[idx + 2], raw[idx + 3]]) as usize;
             idx += 4;
             if idx + loc_len > raw.len() {
-                return Err(GbfError::Format(format!("datetime `{}` truncated locale", field.name)));
+                return Err(GbfError::Format(format!(
+                    "datetime `{}` truncated locale",
+                    field.name
+                )));
             }
             let loc_bytes = &raw[idx..idx + loc_len];
             idx += loc_len;
             let locale = if loc_len > 0 {
-                Some(std::str::from_utf8(loc_bytes).map_err(|e| {
-                    GbfError::Format(format!("datetime `{}` locale invalid UTF-8: {}", field.name, e))
-                })?.to_string())
+                Some(
+                    std::str::from_utf8(loc_bytes)
+                        .map_err(|e| {
+                            GbfError::Format(format!(
+                                "datetime `{}` locale invalid UTF-8: {}",
+                                field.name, e
+                            ))
+                        })?
+                        .to_string(),
+                )
             } else {
                 None
             };
 
-            let fmt_len = u32::from_le_bytes([raw[idx], raw[idx + 1], raw[idx + 2], raw[idx + 3]]) as usize;
+            let fmt_len =
+                u32::from_le_bytes([raw[idx], raw[idx + 1], raw[idx + 2], raw[idx + 3]]) as usize;
             idx += 4;
             if idx + fmt_len > raw.len() {
-                return Err(GbfError::Format(format!("datetime `{}` truncated format", field.name)));
+                return Err(GbfError::Format(format!(
+                    "datetime `{}` truncated format",
+                    field.name
+                )));
             }
             let fmt_bytes = &raw[idx..idx + fmt_len];
             idx += fmt_len;
             let format = if fmt_len > 0 {
-                Some(std::str::from_utf8(fmt_bytes).map_err(|e| {
-                    GbfError::Format(format!("datetime `{}` format invalid UTF-8: {}", field.name, e))
-                })?.to_string())
+                Some(
+                    std::str::from_utf8(fmt_bytes)
+                        .map_err(|e| {
+                            GbfError::Format(format!(
+                                "datetime `{}` format invalid UTF-8: {}",
+                                field.name, e
+                            ))
+                        })?
+                        .to_string(),
+                )
             } else {
                 None
             };
@@ -745,7 +824,10 @@ fn decode_leaf(field: &FieldMeta, raw: &[u8]) -> Result<GbfValue> {
             let _loc_present = (flags & 8) != 0;
 
             if idx + n > raw.len() {
-                return Err(GbfError::Format(format!("datetime `{}` truncated mask", field.name)));
+                return Err(GbfError::Format(format!(
+                    "datetime `{}` truncated mask",
+                    field.name
+                )));
             }
             let is_nat = raw[idx..idx + n].to_vec();
             idx += n;
@@ -798,7 +880,9 @@ fn decode_leaf(field: &FieldMeta, raw: &[u8]) -> Result<GbfValue> {
             if raw.len() != need {
                 return Err(GbfError::Format(format!(
                     "duration `{}` size mismatch: expected {} bytes, got {}",
-                    field.name, need, raw.len()
+                    field.name,
+                    need,
+                    raw.len()
                 )));
             }
             let is_nan = raw[..n].to_vec();
@@ -827,7 +911,9 @@ fn decode_leaf(field: &FieldMeta, raw: &[u8]) -> Result<GbfValue> {
             if raw.len() != need {
                 return Err(GbfError::Format(format!(
                     "calendarDuration `{}` size mismatch: expected {} bytes, got {}",
-                    field.name, need, raw.len()
+                    field.name,
+                    need,
+                    raw.len()
                 )));
             }
             let is_missing = raw[..n].to_vec();
@@ -877,26 +963,40 @@ fn decode_leaf(field: &FieldMeta, raw: &[u8]) -> Result<GbfValue> {
             // repeated: [len u32][utf8 bytes]
             // [codes N u32]
             if raw.len() < 4 {
-                return Err(GbfError::Format(format!("categorical `{}` payload too small", field.name)));
+                return Err(GbfError::Format(format!(
+                    "categorical `{}` payload too small",
+                    field.name
+                )));
             }
             let mut idx = 0usize;
-            let n_cats = u32::from_le_bytes([raw[idx], raw[idx + 1], raw[idx + 2], raw[idx + 3]]) as usize;
+            let n_cats =
+                u32::from_le_bytes([raw[idx], raw[idx + 1], raw[idx + 2], raw[idx + 3]]) as usize;
             idx += 4;
 
             let mut categories = Vec::with_capacity(n_cats);
             for _ in 0..n_cats {
                 if idx + 4 > raw.len() {
-                    return Err(GbfError::Format(format!("categorical `{}` truncated cat len", field.name)));
+                    return Err(GbfError::Format(format!(
+                        "categorical `{}` truncated cat len",
+                        field.name
+                    )));
                 }
-                let len = u32::from_le_bytes([raw[idx], raw[idx + 1], raw[idx + 2], raw[idx + 3]]) as usize;
+                let len = u32::from_le_bytes([raw[idx], raw[idx + 1], raw[idx + 2], raw[idx + 3]])
+                    as usize;
                 idx += 4;
                 if idx + len > raw.len() {
-                    return Err(GbfError::Format(format!("categorical `{}` truncated cat bytes", field.name)));
+                    return Err(GbfError::Format(format!(
+                        "categorical `{}` truncated cat bytes",
+                        field.name
+                    )));
                 }
                 let b = &raw[idx..idx + len];
                 idx += len;
                 let s = std::str::from_utf8(b).map_err(|e| {
-                    GbfError::Format(format!("categorical `{}` invalid UTF-8 cat: {}", field.name, e))
+                    GbfError::Format(format!(
+                        "categorical `{}` invalid UTF-8 cat: {}",
+                        field.name, e
+                    ))
                 })?;
                 categories.push(s.to_string());
             }
@@ -918,7 +1018,11 @@ fn decode_leaf(field: &FieldMeta, raw: &[u8]) -> Result<GbfValue> {
                 codes.push(c);
             }
 
-            Ok(GbfValue::Categorical(CategoricalArray { shape, categories, codes }))
+            Ok(GbfValue::Categorical(CategoricalArray {
+                shape,
+                categories,
+                codes,
+            }))
         }
 
         other => Err(GbfError::Unsupported(format!(
@@ -934,7 +1038,9 @@ fn read_header_and_json(file: &mut File, opts: &ReadOptions) -> Result<(Header, 
     let mut magic = [0u8; 8];
     r.read_exact(&mut magic)?;
     if magic != MAGIC_BYTES {
-        return Err(GbfError::Format("bad magic; not a GBF/GREDBIN file".to_string()));
+        return Err(GbfError::Format(
+            "bad magic; not a GBF/GREDBIN file".to_string(),
+        ));
     }
 
     let header_len = read_u32_le(&mut r)?;
@@ -1025,7 +1131,11 @@ fn read_field_raw(file: &mut File, payload_start: u64, field: &FieldMeta) -> Res
 }
 
 fn decode_field_bytes(field: &FieldMeta, comp_bytes: &[u8], validate: bool) -> Result<Vec<u8>> {
-    let max_out = if field.usize > 0 { field.usize } else { MAX_FIELD_USIZE };
+    let max_out = if field.usize > 0 {
+        field.usize
+    } else {
+        MAX_FIELD_USIZE
+    };
 
     let mut raw = if field.compression.eq_ignore_ascii_case("zlib") {
         zlib_decompress(comp_bytes, max_out).map_err(|e| GbfError::DecompressionFailed {
@@ -1121,23 +1231,40 @@ fn coalesced_read(
         let f_start = f.offset;
         let f_end = checked_add_u64(f.offset, f.csize)?;
 
-        let gap = if f_start > group_end { f_start - group_end } else { 0 };
+        let gap = if f_start > group_end {
+            f_start - group_end
+        } else {
+            0
+        };
         let new_group_size = f_end.saturating_sub(group_start);
 
-        let can_merge = gap <= READ_COALESCE_MAX_GAP_BYTES && new_group_size <= READ_COALESCE_MAX_GROUP_BYTES;
+        let can_merge =
+            gap <= READ_COALESCE_MAX_GAP_BYTES && new_group_size <= READ_COALESCE_MAX_GROUP_BYTES;
 
         if can_merge {
             group_end = group_end.max(f_end);
             group_fields.push(*f);
         } else {
-            out.extend(flush_group(file, payload_start, group_start, group_end, &group_fields)?);
+            out.extend(flush_group(
+                file,
+                payload_start,
+                group_start,
+                group_end,
+                &group_fields,
+            )?);
             group_start = f_start;
             group_end = f_end;
             group_fields = vec![*f];
         }
     }
 
-    out.extend(flush_group(file, payload_start, group_start, group_end, &group_fields)?);
+    out.extend(flush_group(
+        file,
+        payload_start,
+        group_start,
+        group_end,
+        &group_fields,
+    )?);
     Ok(out)
 }
 
@@ -1147,7 +1274,6 @@ pub fn read_file<P: AsRef<Path>>(path: P, opts: ReadOptions) -> Result<GbfValue>
     let (header, header_len, _header_json) = read_header_and_json(&mut file, &opts)?;
 
     let payload_start = field_payload_start(header_len, header.payload_start);
-
 
     // Decode fields without loading the entire payload into memory.
     let mut out = BTreeMap::<String, GbfValue>::new();
@@ -1404,8 +1530,7 @@ pub fn write_file<P: AsRef<Path>>(path: P, value: &GbfValue, opts: WriteOptions)
     if path.exists() {
         std::fs::remove_file(&path)?;
     }
-    tmp.persist(&path)
-        .map_err(|e| GbfError::Io(e.error))?;
+    tmp.persist(&path).map_err(|e| GbfError::Io(e.error))?;
 
     Ok(())
 }

@@ -46,7 +46,7 @@ classdef Gbin
         % Compression settings (fast-first)
         % Default policy: compression enabled (auto mode decides per-field)
         DEFAULT_COMPRESSION = true;
-        DEFAULT_COMPRESSION_MODE = 'never'; % 'auto'|'always'|'never'
+        DEFAULT_COMPRESSION_MODE = 'auto'; % 'auto'|'always'|'never'
         COMPRESS_THRESHOLD_BYTES = 1024;   % skip compression below this
         MAX_HEADER_LEN_BYTES = 64*1024*1024; % 64 MiB
         

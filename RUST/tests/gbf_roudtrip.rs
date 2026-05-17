@@ -39,7 +39,7 @@ fn build_edge_case_value() -> GbfValue {
                 }
                 out
             }),
-        })
+        }),
     );
 
     // Integer arrays
@@ -58,7 +58,7 @@ fn build_edge_case_value() -> GbfValue {
                 out
             },
             imag_le: None,
-        })
+        }),
     );
     root.insert(
         "u64".into(),
@@ -75,17 +75,23 @@ fn build_edge_case_value() -> GbfValue {
                 out
             },
             imag_le: None,
-        })
+        }),
     );
 
     // Logical empty + non-empty
     root.insert(
         "empty_logical".into(),
-        GbfValue::Logical(LogicalArray { shape: vec![0, 0], data: vec![] }),
+        GbfValue::Logical(LogicalArray {
+            shape: vec![0, 0],
+            data: vec![],
+        }),
     );
     root.insert(
         "logical".into(),
-        GbfValue::Logical(LogicalArray { shape: vec![1, 4], data: vec![1, 0, 1, 1] }),
+        GbfValue::Logical(LogicalArray {
+            shape: vec![1, 4],
+            data: vec![1, 0, 1, 1],
+        }),
     );
 
     // Strings: unicode, empty, missing, newline
@@ -105,7 +111,10 @@ fn build_edge_case_value() -> GbfValue {
     );
 
     // Char: include newline
-    root.insert("char".into(), GbfValue::Char(CharArray::from_str_row("A\nB")));
+    root.insert(
+        "char".into(),
+        GbfValue::Char(CharArray::from_str_row("A\nB")),
+    );
 
     // datetime without tz/locale/format and with NaT mask
     root.insert(
@@ -162,7 +171,10 @@ fn build_edge_case_value() -> GbfValue {
     let mut d = BTreeMap::<String, GbfValue>::new();
     d.insert(
         "leaf".into(),
-        GbfValue::Numeric(NumericArray::from_f64_column_major(vec![1, 3], vec![1.0, 2.0, 3.0])),
+        GbfValue::Numeric(NumericArray::from_f64_column_major(
+            vec![1, 3],
+            vec![1.0, 2.0, 3.0],
+        )),
     );
     c.insert("d".into(), GbfValue::Struct(d));
     b.insert("c".into(), GbfValue::Struct(c));
@@ -203,7 +215,10 @@ fn build_test_value() -> GbfValue {
     );
 
     // char
-    root.insert("name".to_string(), GbfValue::Char(CharArray::from_str_row("GBF")));
+    root.insert(
+        "name".to_string(),
+        GbfValue::Char(CharArray::from_str_row("GBF")),
+    );
 
     // string array 2x2 (column-major flatten)
     // shape [2,2] => N=4
@@ -275,10 +290,13 @@ fn build_test_value() -> GbfValue {
 
     // nested struct meta/
     let mut meta = BTreeMap::<String, GbfValue>::new();
-    meta.insert("note".into(), GbfValue::String(StringArray {
-        shape: vec![1, 1],
-        data: vec![Some("hello".into())],
-    }));
+    meta.insert(
+        "note".into(),
+        GbfValue::String(StringArray {
+            shape: vec![1, 1],
+            data: vec![Some("hello".into())],
+        }),
+    );
     root.insert("meta".into(), GbfValue::Struct(meta));
 
     GbfValue::Struct(root)
@@ -321,7 +339,11 @@ fn random_access_read_var() {
 
     // read nested var meta.note
     let note = read_var(&file, "meta.note", ropts).unwrap();
-    let expected = if let Some(x) = v.get_path("meta.note") { x.clone() } else { panic!("missing expected"); };
+    let expected = if let Some(x) = v.get_path("meta.note") {
+        x.clone()
+    } else {
+        panic!("missing expected");
+    };
     assert_eq!(note, expected);
 
     // read subtree meta
@@ -443,9 +465,7 @@ fn magic_mismatch_is_detected() {
 
     let err = read_file(&bad, ReadOptions { validate: true }).unwrap_err();
     // Accept either BadMagic or any error mentioning "magic"
-    assert!(
-        err.to_string().to_lowercase().contains("magic")
-    );
+    assert!(err.to_string().to_lowercase().contains("magic"));
 }
 
 #[test]
@@ -571,9 +591,5 @@ fn corrupt_compressed_payload_is_detected() {
     let err = read_file(&bad, ReadOptions { validate: true }).unwrap_err();
     // Accept either a field CRC mismatch or any error mentioning "zlib", "decompress", or "crc"
     let s = format!("{err:?}").to_lowercase();
-    assert!(
-        s.contains("crc")
-            || s.contains("zlib")
-            || s.contains("decompress")
-    );
+    assert!(s.contains("crc") || s.contains("zlib") || s.contains("decompress"));
 }

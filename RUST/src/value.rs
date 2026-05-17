@@ -63,7 +63,10 @@ impl NumericClass {
 }
 
 pub fn element_count(shape: &[usize]) -> usize {
-    shape.iter().copied().fold(1usize, |acc, d| acc.saturating_mul(d))
+    shape
+        .iter()
+        .copied()
+        .fold(1usize, |acc, d| acc.saturating_mul(d))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

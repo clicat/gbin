@@ -38,10 +38,18 @@ pub enum GbfError {
     DecompressionFailed { name: String, message: String },
 
     #[error("field `{name}` decoded size mismatch: expected {expected} bytes, got {got} bytes")]
-    FieldSizeMismatch { name: String, expected: u64, got: u64 },
+    FieldSizeMismatch {
+        name: String,
+        expected: u64,
+        got: u64,
+    },
 
     #[error("field `{name}` CRC mismatch: expected {expected:08X}, got {got:08X}")]
-    FieldCrcMismatch { name: String, expected: u32, got: u32 },
+    FieldCrcMismatch {
+        name: String,
+        expected: u32,
+        got: u32,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, GbfError>;

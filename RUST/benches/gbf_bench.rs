@@ -136,7 +136,9 @@ fn approx_payload_bytes(v: &GbfValue) -> usize {
     // Rough estimate: sum numeric bytes only, for MB/s throughput sanity
     fn rec(v: &GbfValue) -> usize {
         match v {
-            GbfValue::Numeric(n) => n.real_le.len() + n.imag_le.as_ref().map(|x| x.len()).unwrap_or(0),
+            GbfValue::Numeric(n) => {
+                n.real_le.len() + n.imag_le.as_ref().map(|x| x.len()).unwrap_or(0)
+            }
             GbfValue::Struct(m) => m.values().map(rec).sum(),
             _ => 0,
         }
@@ -166,7 +168,9 @@ fn bench_write_read(c: &mut Criterion) {
 
     // Leaf size for random-access throughput sanity: model.weights raw bytes (real + imag)
     let leaf_bytes: u64 = match read_path(&v, "model.weights") {
-        Some(GbfValue::Numeric(n)) => (n.real_le.len() + n.imag_le.as_ref().map(|x| x.len()).unwrap_or(0)) as u64,
+        Some(GbfValue::Numeric(n)) => {
+            (n.real_le.len() + n.imag_le.as_ref().map(|x| x.len()).unwrap_or(0)) as u64
+        }
         _ => 0,
     };
 
@@ -254,7 +258,8 @@ fn bench_write_read(c: &mut Criterion) {
                 &file,
                 |b, file| {
                     b.iter(|| {
-                        let _ = read_var(file, "model.weights", ReadOptions { validate: true }).unwrap();
+                        let _ = read_var(file, "model.weights", ReadOptions { validate: true })
+                            .unwrap();
                     })
                 },
             );

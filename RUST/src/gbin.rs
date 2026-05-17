@@ -2,12 +2,14 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use gbin::*;
 use std::collections::BTreeMap;
-use std::io::{Read};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEvent, KeyModifiers,
-        DisableMouseCapture, EnableMouseCapture, MouseEventKind},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
+        MouseEventKind,
+    },
     execute,
     style::Stylize,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
@@ -23,7 +25,11 @@ use ratatui::{
 use std::time::Duration;
 
 #[derive(Parser, Debug)]
-#[command(name = "gbin", version, about = "GBF/GREDBIN inspector (header/tree/show)")]
+#[command(
+    name = "gbin",
+    version,
+    about = "GBF/GREDBIN inspector (header/tree/show)"
+)]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -124,7 +130,6 @@ fn main() -> Result<()> {
 // File layout: [8 magic][u32 header_len LE][header_json bytes][payload bytes...]
 //
 
-
 //
 // ===== Commands =====
 //
@@ -132,19 +137,22 @@ fn main() -> Result<()> {
 fn cmd_header(path: &std::path::Path, raw: bool, pretty: bool, validate: bool) -> Result<()> {
     if validate {
         // Full file validation (can be expensive, but definitive)
-        let _ = read_file(path, ReadOptions { validate: true })
-            .with_context(|| "validate failed")?;
+        let _ =
+            read_file(path, ReadOptions { validate: true }).with_context(|| "validate failed")?;
     }
 
     // Read header using library API
-	let (hdr, header_len, raw_json) = gbin::read_header_only(path, gbin::ReadOptions { validate: true })?;
+    let (hdr, header_len, raw_json) =
+        gbin::read_header_only(path, gbin::ReadOptions { validate: true })?;
 
     // Helper: read magic from file
     fn file_magic(path: &std::path::Path) -> Result<String> {
         let mut f = std::fs::File::open(path)?;
         let mut magic = [0u8; 8];
         f.read_exact(&mut magic)?;
-        Ok(String::from_utf8_lossy(&magic).trim_end_matches('\0').to_string())
+        Ok(String::from_utf8_lossy(&magic)
+            .trim_end_matches('\0')
+            .to_string())
     }
     let magic_s = file_magic(path)?;
 
@@ -268,12 +276,7 @@ fn print_tree(
         let pad = " ".repeat(indent);
 
         if !child.children.is_empty() && child.leaf_idx.is_none() {
-            println!(
-                "{}{}{}",
-                pad,
-                name.as_str().cyan().bold(),
-                "/".dim()
-            );
+            println!("{}{}{}", pad, name.as_str().cyan().bold(), "/".dim());
             print_tree(child, fields, indent + 2, max_depth, details);
             continue;
         }
@@ -340,24 +343,26 @@ fn print_tree(
 
         // If it also has children, show as directory too.
         if !child.children.is_empty() {
-            println!(
-                "{}{}{}",
-                pad,
-                name.as_str().cyan().bold(),
-                "/".dim()
-            );
+            println!("{}{}{}", pad, name.as_str().cyan().bold(), "/".dim());
             print_tree(child, fields, indent + 2, max_depth, details);
         }
     }
 }
 
-fn cmd_tree(path: &std::path::Path, prefix: Option<&str>, max_depth: usize, details: bool, validate: bool) -> Result<()> {
+fn cmd_tree(
+    path: &std::path::Path,
+    prefix: Option<&str>,
+    max_depth: usize,
+    details: bool,
+    validate: bool,
+) -> Result<()> {
     if validate {
-        let _ = read_file(path, ReadOptions { validate: true })
-            .with_context(|| "validate failed")?;
+        let _ =
+            read_file(path, ReadOptions { validate: true }).with_context(|| "validate failed")?;
     }
 
-    let (hdr, _header_len, _raw_json) = gbin::read_header_only(path, gbin::ReadOptions { validate: true })?;
+    let (hdr, _header_len, _raw_json) =
+        gbin::read_header_only(path, gbin::ReadOptions { validate: true })?;
 
     let mut root = TreeNode::default();
     for (i, f) in hdr.fields.iter().enumerate() {
@@ -411,11 +416,21 @@ fn cmd_show(
     let subtree = if var.is_empty() {
         &root
     } else {
-        tree_find(&root, var).ok_or_else(|| anyhow::anyhow!("var/prefix '{}' not found", var.red().bold()))?
+        tree_find(&root, var)
+            .ok_or_else(|| anyhow::anyhow!("var/prefix '{}' not found", var.red().bold()))?
     };
 
     // Flatten visible nodes based on expansion state.
-    let mut state = ShowState::new(path.to_path_buf(), var.to_string(), max_elems, rows, cols, stats, ropts, hdr.fields.clone());
+    let mut state = ShowState::new(
+        path.to_path_buf(),
+        var.to_string(),
+        max_elems,
+        rows,
+        cols,
+        stats,
+        ropts,
+        hdr.fields.clone(),
+    );
     state.load_tree_from(subtree, var);
 
     run_show_tui(&mut state)
@@ -465,9 +480,7 @@ fn decode_scalar_to_string(class_key: &str, bytes: &[u8]) -> String {
                     format!("{:.6e}", v)
                 } else {
                     let s = format!("{:.6}", v);
-                    s.trim_end_matches('0')
-                        .trim_end_matches('.')
-                        .to_string()
+                    s.trim_end_matches('0').trim_end_matches('.').to_string()
                 }
             }
         }
@@ -483,9 +496,7 @@ fn decode_scalar_to_string(class_key: &str, bytes: &[u8]) -> String {
                     format!("{:.6e}", v)
                 } else {
                     let s = format!("{:.6}", v);
-                    s.trim_end_matches('0')
-                        .trim_end_matches('.')
-                        .to_string()
+                    s.trim_end_matches('0').trim_end_matches('.').to_string()
                 }
             }
         }
@@ -528,8 +539,6 @@ fn decode_scalar_to_string(class_key: &str, bytes: &[u8]) -> String {
         }
     }
 }
-
-
 
 // ===== Interactive SHOW TUI =====
 
@@ -674,7 +683,9 @@ impl ShowState {
     }
 
     fn toggle_expand_selected(&mut self, expand: bool) {
-        let Some(row) = self.selected_row() else { return; };
+        let Some(row) = self.selected_row() else {
+            return;
+        };
         if row.is_leaf {
             return;
         }
@@ -705,7 +716,9 @@ impl ShowState {
 
     fn preview_selected(&mut self) {
         let (is_leaf, node_path) = {
-            let Some(row) = self.selected_row() else { return; };
+            let Some(row) = self.selected_row() else {
+                return;
+            };
             (row.is_leaf, row.node_path.clone())
         };
 
@@ -716,10 +729,7 @@ impl ShowState {
         if is_leaf {
             self.preview_title = format!("{}  (leaf)", node_path);
 
-            let meta = self
-                .fields
-                .iter()
-                .find(|f| f.name == node_path);
+            let meta = self.fields.iter().find(|f| f.name == node_path);
 
             let mut lines = vec![];
 
@@ -745,7 +755,8 @@ impl ShowState {
             match read_var(&self.file, &node_path, self.ropts.clone()) {
                 Ok(v) => {
                     // Render preview into lines
-                    let mut rendered = render_value_preview(&v, self.max_elems, self.rows, self.cols, self.stats);
+                    let mut rendered =
+                        render_value_preview(&v, self.max_elems, self.rows, self.cols, self.stats);
 
                     // We already printed the header metadata above (kind/class/shape/etc.).
                     // Avoid repeating it in the value preview when possible.
@@ -761,7 +772,11 @@ impl ShowState {
                     }
 
                     // If we removed the first line and the next line is empty, drop that too.
-                    if rendered.first().map(|s| s.trim().is_empty()).unwrap_or(false) {
+                    if rendered
+                        .first()
+                        .map(|s| s.trim().is_empty())
+                        .unwrap_or(false)
+                    {
                         rendered.remove(0);
                     }
 
@@ -825,12 +840,10 @@ fn build_ui_node(tree: &TreeNode, prefix: String) -> UiNode {
     }
 
     // Sort: branches first, then leaves; stable by label
-    children.sort_by(|a, b| {
-        match (a.is_leaf, b.is_leaf) {
-            (false, true) => std::cmp::Ordering::Less,
-            (true, false) => std::cmp::Ordering::Greater,
-            _ => a.label.cmp(&b.label),
-        }
+    children.sort_by(|a, b| match (a.is_leaf, b.is_leaf) {
+        (false, true) => std::cmp::Ordering::Less,
+        (true, false) => std::cmp::Ordering::Greater,
+        _ => a.label.cmp(&b.label),
     });
 
     // Root node label is the last component of prefix.
@@ -870,7 +883,12 @@ fn ensure_visible(scroll: u16, sel: u16, viewport_h: u16) -> u16 {
     }
 }
 
-fn flatten_visible(node: &UiNode, depth: usize, out: &mut Vec<FlatRow>, expanded: &BTreeMap<String, bool>) {
+fn flatten_visible(
+    node: &UiNode,
+    depth: usize,
+    out: &mut Vec<FlatRow>,
+    expanded: &BTreeMap<String, bool>,
+) {
     // Skip the artificial root label from printing if it’s empty prefix.
     if !node.full_path.is_empty() {
         let is_expanded = expanded.get(&node.full_path).copied().unwrap_or(false);
@@ -923,7 +941,9 @@ fn run_show_tui(state: &mut ShowState) -> Result<()> {
             // Poll for input
             if event::poll(Duration::from_millis(120))? {
                 match event::read()? {
-                    Event::Key(KeyEvent { code, modifiers, .. }) => {
+                    Event::Key(KeyEvent {
+                        code, modifiers, ..
+                    }) => {
                         // Ctrl+C exits too
                         if code == KeyCode::Char('c') && modifiers.contains(KeyModifiers::CONTROL) {
                             break;
@@ -936,18 +956,22 @@ fn run_show_tui(state: &mut ShowState) -> Result<()> {
                             KeyCode::Right => state.toggle_expand_selected(true),
                             KeyCode::Left => state.toggle_expand_selected(false),
                             KeyCode::Enter => state.preview_selected(),
-                            KeyCode::PageUp => {
-                                match state.focus {
-                                    Focus::Tree => state.tree_scroll = state.tree_scroll.saturating_sub(5),
-                                    Focus::Preview => state.preview_scroll = state.preview_scroll.saturating_sub(5),
+                            KeyCode::PageUp => match state.focus {
+                                Focus::Tree => {
+                                    state.tree_scroll = state.tree_scroll.saturating_sub(5)
                                 }
-                            }
-                            KeyCode::PageDown => {
-                                match state.focus {
-                                    Focus::Tree => state.tree_scroll = state.tree_scroll.saturating_add(5),
-                                    Focus::Preview => state.preview_scroll = state.preview_scroll.saturating_add(5),
+                                Focus::Preview => {
+                                    state.preview_scroll = state.preview_scroll.saturating_sub(5)
                                 }
-                            }
+                            },
+                            KeyCode::PageDown => match state.focus {
+                                Focus::Tree => {
+                                    state.tree_scroll = state.tree_scroll.saturating_add(5)
+                                }
+                                Focus::Preview => {
+                                    state.preview_scroll = state.preview_scroll.saturating_add(5)
+                                }
+                            },
                             KeyCode::Tab => {
                                 state.focus = match state.focus {
                                     Focus::Tree => Focus::Preview,
@@ -982,23 +1006,21 @@ fn run_show_tui(state: &mut ShowState) -> Result<()> {
                             _ => {}
                         }
                     }
-                    Event::Mouse(me) => {
-                        match me.kind {
-                            MouseEventKind::ScrollUp => {
-                                match state.focus {
-                                    Focus::Tree => state.tree_scroll = state.tree_scroll.saturating_sub(1),
-                                    Focus::Preview => state.preview_scroll = state.preview_scroll.saturating_sub(1),
-                                }
+                    Event::Mouse(me) => match me.kind {
+                        MouseEventKind::ScrollUp => match state.focus {
+                            Focus::Tree => state.tree_scroll = state.tree_scroll.saturating_sub(1),
+                            Focus::Preview => {
+                                state.preview_scroll = state.preview_scroll.saturating_sub(1)
                             }
-                            MouseEventKind::ScrollDown => {
-                                match state.focus {
-                                    Focus::Tree => state.tree_scroll = state.tree_scroll.saturating_add(1),
-                                    Focus::Preview => state.preview_scroll = state.preview_scroll.saturating_add(1),
-                                }
+                        },
+                        MouseEventKind::ScrollDown => match state.focus {
+                            Focus::Tree => state.tree_scroll = state.tree_scroll.saturating_add(1),
+                            Focus::Preview => {
+                                state.preview_scroll = state.preview_scroll.saturating_add(1)
                             }
-                            _ => {}
-                        }
-                    }
+                        },
+                        _ => {}
+                    },
                     Event::Resize(_, _) => {
                         // handled by redraw
                     }
@@ -1033,7 +1055,11 @@ fn draw_tree_panel(f: &mut ratatui::Frame<'_>, area: Rect, state: &ShowState) {
     let title = format!(
         "gbin show  file={}  root={}",
         state.file.display(),
-        if state.root_prefix.is_empty() { "<root>" } else { &state.root_prefix }
+        if state.root_prefix.is_empty() {
+            "<root>"
+        } else {
+            &state.root_prefix
+        }
     );
 
     let block = Block::default().title(title).borders(Borders::ALL);
@@ -1063,13 +1089,17 @@ fn draw_tree_panel(f: &mut ratatui::Frame<'_>, area: Rect, state: &ShowState) {
             } else if row.is_leaf {
                 Style::default().fg(Color::White)
             } else {
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
             };
 
             let glyph_style = if row.is_leaf {
                 Style::default().fg(Color::Magenta)
             } else {
-                Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .fg(Color::Blue)
+                    .add_modifier(Modifier::BOLD)
             };
 
             let mut spans = vec![
@@ -1116,15 +1146,17 @@ fn draw_preview_panel(f: &mut ratatui::Frame<'_>, area: Rect, state: &ShowState)
         let _ = err;
     }
 
-    let block = Block::default()
-        .title(title)
-        .borders(Borders::ALL);
+    let block = Block::default().title(title).borders(Borders::ALL);
 
     let mut lines: Vec<Line> = vec![];
 
     for s in &state.preview_lines {
         // Keep matrix/text preview lines untouched.
-        if s.starts_with("  ") || s.starts_with("preview") || s.starts_with("stats") || s.starts_with("ERROR") {
+        if s.starts_with("  ")
+            || s.starts_with("preview")
+            || s.starts_with("stats")
+            || s.starts_with("ERROR")
+        {
             lines.push(Line::from(Span::raw(s.clone())));
             continue;
         }
@@ -1132,14 +1164,24 @@ fn draw_preview_panel(f: &mut ratatui::Frame<'_>, area: Rect, state: &ShowState)
         // Prefer "key = value" formatting (we generate it in preview_selected/renderers).
         if let Some((k, v)) = s.split_once(" = ") {
             lines.push(Line::from(vec![
-                Span::styled(k.to_string(), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    k.to_string(),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
                 Span::raw(" = "),
                 Span::styled(v.to_string(), Style::default().fg(Color::Green)),
             ]));
         } else if let Some((k, v)) = s.split_once('=') {
             // Backward compatibility for any remaining "key=value" lines.
             lines.push(Line::from(vec![
-                Span::styled(k.to_string(), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    k.to_string(),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
                 Span::raw(" = "),
                 Span::styled(v.trim().to_string(), Style::default().fg(Color::Green)),
             ]));
@@ -1160,7 +1202,13 @@ fn draw_preview_panel(f: &mut ratatui::Frame<'_>, area: Rect, state: &ShowState)
 }
 
 /// Render the value preview into lines (reusing your existing decoding logic)
-fn render_value_preview(v: &GbfValue, max_elems: usize, rows: usize, cols: usize, stats: bool) -> Vec<String> {
+fn render_value_preview(
+    v: &GbfValue,
+    max_elems: usize,
+    rows: usize,
+    cols: usize,
+    stats: bool,
+) -> Vec<String> {
     // Keep it simple: mirror the same output as print_value_preview but as Vec<String>.
     // We intentionally do not rely on stdout capturing.
     let mut out: Vec<String> = vec![];
@@ -1228,11 +1276,7 @@ fn render_value_preview(v: &GbfValue, max_elems: usize, rows: usize, cols: usize
                     out.push(format!("  [{}] <undefined>", i));
                 } else {
                     let idx = (code as usize).saturating_sub(1);
-                    let label = cat
-                        .categories
-                        .get(idx)
-                        .map(|s| s.as_str())
-                        .unwrap_or("<?>");
+                    let label = cat.categories.get(idx).map(|s| s.as_str()).unwrap_or("<?>");
                     out.push(format!("  [{}] {} => {}", i, code, label));
                 }
             }
@@ -1243,7 +1287,13 @@ fn render_value_preview(v: &GbfValue, max_elems: usize, rows: usize, cols: usize
     out
 }
 
-fn render_numeric_preview(n: &NumericArray, max_elems: usize, rows: usize, cols: usize, stats: bool) -> Vec<String> {
+fn render_numeric_preview(
+    n: &NumericArray,
+    max_elems: usize,
+    rows: usize,
+    cols: usize,
+    stats: bool,
+) -> Vec<String> {
     let mut out = vec![];
 
     let class_key = numeric_class_key(&n.class);
@@ -1288,7 +1338,13 @@ fn render_numeric_preview(n: &NumericArray, max_elems: usize, rows: usize, cols:
                     row.push("?".into());
                 }
             }
-            out.push(format!("  {}", row.iter().map(|x| format!("{:>14}", x)).collect::<Vec<_>>().join(" ")));
+            out.push(format!(
+                "  {}",
+                row.iter()
+                    .map(|x| format!("{:>14}", x))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            ));
         }
     } else if shape.len() == 3
         && !n.complex
@@ -1310,7 +1366,10 @@ fn render_numeric_preview(n: &NumericArray, max_elems: usize, rows: usize, cols:
         let r_show = rows.min(r_total);
         let c_show = cols.min(c_total);
 
-        out.push(format!("preview (top-left {}x{}x{}):", r_show, c_show, k_show));
+        out.push(format!(
+            "preview (top-left {}x{}x{}):",
+            r_show, c_show, k_show
+        ));
 
         for k in 0..k_show {
             out.push(format!("slice [{}]", k));
@@ -1426,7 +1485,11 @@ fn render_numeric_preview(n: &NumericArray, max_elems: usize, rows: usize, cols:
             i += step;
         }
 
-        let mean = if count > 0 { sum / (count as f64) } else { f64::NAN };
+        let mean = if count > 0 {
+            sum / (count as f64)
+        } else {
+            f64::NAN
+        };
         out.push(format!(
             "stats (full): count_finite={} nan={} inf={} min={} max={} mean={}",
             count, nan, inf, min, max, mean

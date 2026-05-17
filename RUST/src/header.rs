@@ -12,9 +12,8 @@ static CRC_RE: Lazy<Regex> = Lazy::new(|| {
     // Match: "header_crc32_hex" <ws> : <ws> "DEADBEEF" and capture the whitespace around ':'
     Regex::new(r#""header_crc32_hex"(\s*:\s*)"([0-9A-Fa-f]{8})""#).expect("regex")
 });
-static CRC_FALLBACK_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r#""header_crc32_hex"\s*:\s*"[^"]+""#).expect("regex")
-});
+static CRC_FALLBACK_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r#""header_crc32_hex"\s*:\s*"[^"]+""#).expect("regex"));
 
 fn de_u64<'de, D>(deserializer: D) -> std::result::Result<u64, D::Error>
 where
