@@ -3,3 +3,5 @@ target
 build
 *.asv
 *.gbf
+CPP/Archive.zip
+CPP/gbinpp.zip

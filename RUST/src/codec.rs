@@ -1130,6 +1130,47 @@ fn read_field_raw(file: &mut File, payload_start: u64, field: &FieldMeta) -> Res
     Ok(buf)
 }
 
+fn read_field_raw_range(
+    file: &mut File,
+    payload_start: u64,
+    field: &FieldMeta,
+    start: u64,
+    len: u64,
+) -> Result<Vec<u8>> {
+    if field.csize > MAX_FIELD_CSIZE {
+        return Err(GbfError::Unsupported(format!(
+            "field `{}` csize exceeds configured limit",
+            field.name
+        )));
+    }
+    if start > field.csize || len > field.csize.saturating_sub(start) {
+        return Err(GbfError::FieldOutOfBounds {
+            name: field.name.clone(),
+            offset: field.offset.saturating_add(start),
+            csize: len,
+            payload_len: field.csize,
+        });
+    }
+
+    let fs = file.metadata()?.len();
+    let pos = checked_add_u64(checked_add_u64(payload_start, field.offset)?, start)?;
+    let end = checked_add_u64(pos, len)?;
+    if end > fs {
+        return Err(GbfError::FieldOutOfBounds {
+            name: field.name.clone(),
+            offset: field.offset.saturating_add(start),
+            csize: len,
+            payload_len: fs.saturating_sub(payload_start),
+        });
+    }
+
+    file.seek(SeekFrom::Start(pos))?;
+    let sz = u64_to_usize(len, "field range size")?;
+    let mut buf = vec![0u8; sz];
+    file.read_exact(&mut buf)?;
+    Ok(buf)
+}
+
 fn decode_field_bytes(field: &FieldMeta, comp_bytes: &[u8], validate: bool) -> Result<Vec<u8>> {
     let max_out = if field.usize > 0 {
         field.usize
@@ -1174,6 +1215,188 @@ fn decode_field_bytes(field: &FieldMeta, comp_bytes: &[u8], validate: bool) -> R
     // MATLAB always stores little-endian in payload; raw is uncompressed bytes.
     // We keep raw as-is for decode.
     Ok(std::mem::take(&mut raw))
+}
+
+pub fn read_numeric_var_rows<P: AsRef<Path>>(
+    path: P,
+    var_path: &str,
+    row_start: usize,
+    row_end: usize,
+    opts: ReadOptions,
+) -> Result<NumericArray> {
+    let path = normalize_path(path);
+    let mut file = File::open(&path)?;
+    let (header, header_len, _header_json) = read_header_and_json(&mut file, &opts)?;
+    let payload_start = field_payload_start(header_len, header.payload_start);
+    let var_path = var_path.trim();
+
+    let field = header
+        .fields
+        .iter()
+        .find(|f| f.name == var_path)
+        .ok_or_else(|| GbfError::VarNotFound(var_path.to_string()))?;
+    if !field.kind.eq_ignore_ascii_case("numeric") {
+        return Err(GbfError::Unsupported(format!(
+            "field `{}` is `{}`, not numeric",
+            field.name, field.kind
+        )));
+    }
+
+    let cls = NumericClass::from_matlab_class(&field.class_name).ok_or_else(|| {
+        GbfError::Unsupported(format!("unknown numeric class `{}`", field.class_name))
+    })?;
+    let shape: Vec<usize> = field
+        .shape
+        .iter()
+        .map(|&d| u64_to_usize(d, "shape dim"))
+        .collect::<Result<Vec<_>>>()?;
+    if shape.is_empty() {
+        return Err(GbfError::Format(format!(
+            "numeric `{}` has empty shape",
+            field.name
+        )));
+    }
+    let rows = shape[0];
+    if row_start > row_end || row_end > rows {
+        return Err(GbfError::Format(format!(
+            "numeric `{}` row range {}..{} outside 0..{}",
+            field.name, row_start, row_end, rows
+        )));
+    }
+    let out_rows = row_end - row_start;
+    let cols = if shape.len() == 1 {
+        1
+    } else {
+        shape[1..]
+            .iter()
+            .try_fold(1usize, |acc, &d| mul_usize(acc, d))?
+    };
+    let bpe = cls.bytes_per_element();
+    let part_bytes = mul_usize(element_count_checked(&shape)?, bpe)?;
+
+    if opts.validate
+        || (!field.compression.trim().is_empty() && !field.compression.eq_ignore_ascii_case("none"))
+    {
+        let comp_bytes = read_field_raw(&mut file, payload_start, field)?;
+        let raw = decode_field_bytes(field, &comp_bytes, opts.validate)?;
+        let GbfValue::Numeric(arr) = decode_leaf(field, &raw)? else {
+            return Err(GbfError::Format(format!(
+                "field `{}` decoded as non-numeric",
+                field.name
+            )));
+        };
+        return slice_numeric_rows(&arr, row_start, row_end);
+    }
+
+    let out_per_col_bytes = mul_usize(out_rows, bpe)?;
+    let mut real_le = Vec::with_capacity(mul_usize(out_per_col_bytes, cols)?);
+    for col in 0..cols {
+        let elem_offset = col
+            .checked_mul(rows)
+            .and_then(|v| v.checked_add(row_start))
+            .ok_or_else(|| GbfError::Format("numeric row offset overflow".to_string()))?;
+        let byte_offset = mul_usize(elem_offset, bpe)? as u64;
+        let chunk = read_field_raw_range(
+            &mut file,
+            payload_start,
+            field,
+            byte_offset,
+            out_per_col_bytes as u64,
+        )?;
+        real_le.extend_from_slice(&chunk);
+    }
+
+    let imag_le = if field.complex {
+        let mut imag = Vec::with_capacity(mul_usize(out_per_col_bytes, cols)?);
+        for col in 0..cols {
+            let elem_offset = col
+                .checked_mul(rows)
+                .and_then(|v| v.checked_add(row_start))
+                .ok_or_else(|| GbfError::Format("numeric row offset overflow".to_string()))?;
+            let byte_offset =
+                checked_add_u64(part_bytes as u64, mul_usize(elem_offset, bpe)? as u64)?;
+            let chunk = read_field_raw_range(
+                &mut file,
+                payload_start,
+                field,
+                byte_offset,
+                out_per_col_bytes as u64,
+            )?;
+            imag.extend_from_slice(&chunk);
+        }
+        Some(imag)
+    } else {
+        None
+    };
+
+    let mut out_shape = shape;
+    out_shape[0] = out_rows;
+    Ok(NumericArray {
+        class: cls,
+        shape: out_shape,
+        complex: field.complex,
+        real_le,
+        imag_le,
+    })
+}
+
+fn slice_numeric_rows(
+    arr: &NumericArray,
+    row_start: usize,
+    row_end: usize,
+) -> Result<NumericArray> {
+    if arr.shape.is_empty() {
+        return Err(GbfError::Format(
+            "numeric array has empty shape".to_string(),
+        ));
+    }
+    let rows = arr.shape[0];
+    if row_start > row_end || row_end > rows {
+        return Err(GbfError::Format(format!(
+            "numeric row range {}..{} outside 0..{}",
+            row_start, row_end, rows
+        )));
+    }
+    let out_rows = row_end - row_start;
+    let cols = if arr.shape.len() == 1 {
+        1
+    } else {
+        arr.shape[1..]
+            .iter()
+            .try_fold(1usize, |acc, &d| mul_usize(acc, d))?
+    };
+    let bpe = arr.class.bytes_per_element();
+    let out_per_col_bytes = mul_usize(out_rows, bpe)?;
+    let mut real_le = Vec::with_capacity(mul_usize(out_per_col_bytes, cols)?);
+    for col in 0..cols {
+        let start = mul_usize(col * rows + row_start, bpe)?;
+        let end = start + out_per_col_bytes;
+        real_le.extend_from_slice(&arr.real_le[start..end]);
+    }
+    let imag_le = if arr.complex {
+        let src = arr
+            .imag_le
+            .as_ref()
+            .ok_or_else(|| GbfError::Format("complex numeric array missing imag_le".to_string()))?;
+        let mut imag = Vec::with_capacity(mul_usize(out_per_col_bytes, cols)?);
+        for col in 0..cols {
+            let start = mul_usize(col * rows + row_start, bpe)?;
+            let end = start + out_per_col_bytes;
+            imag.extend_from_slice(&src[start..end]);
+        }
+        Some(imag)
+    } else {
+        None
+    };
+    let mut shape = arr.shape.clone();
+    shape[0] = out_rows;
+    Ok(NumericArray {
+        class: arr.class,
+        shape,
+        complex: arr.complex,
+        real_le,
+        imag_le,
+    })
 }
 
 fn coalesced_read(

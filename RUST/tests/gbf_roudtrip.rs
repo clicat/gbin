@@ -303,6 +303,27 @@ fn build_test_value() -> GbfValue {
 }
 
 #[test]
+fn numeric_var_rows_reads_first_dimension_slice() {
+    let dir = tempdir().unwrap();
+    let file = dir.path().join("rows.gbf");
+    let v = build_test_value();
+
+    let mut wopts = WriteOptions::default();
+    wopts.compression = false;
+    wopts.compression_mode = CompressionMode::Never;
+    write_file(&file, &v, wopts).unwrap();
+
+    let rows = read_numeric_var_rows(&file, "A", 1, 3, ReadOptions::default()).unwrap();
+    assert_eq!(rows.shape, vec![2, 3]);
+    let vals: Vec<f64> = rows
+        .real_le
+        .chunks_exact(8)
+        .map(|b| f64::from_le_bytes(b.try_into().unwrap()))
+        .collect();
+    assert_eq!(vals, vec![4.0, 7.0, 5.0, 8.0, 6.0, 9.0]);
+}
+
+#[test]
 fn roundtrip_all_types_with_crc() {
     let dir = tempdir().unwrap();
     let file = dir.path().join("test.gbf");
